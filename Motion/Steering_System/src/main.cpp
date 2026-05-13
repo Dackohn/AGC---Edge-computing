@@ -1,0 +1,305 @@
+// --- NANO #2: CAN DRIVER (RC RECEIVER) + TRACTION CONTROL (PWM) ---
+// Reconstructed from firmware binary + schematic Schematic_shield-can_2026-04-29
+#include <Arduino.h>
+#include <SPI.h>
+#include <mcp_can.h>
+#include <stdint.h>
+
+// ================================================================
+// 1. PIN DEFINITIONS  (verified against schematic)
+// ================================================================
+
+// RC INPUTS — all on Port D, read via PCINT2
+#define PIN_RC_THR    2   // D2 — Throttle RC channel
+#define PIN_RC_ARM    3   // D3 — Arm switch RC channel
+#define PIN_RC_STEER  5   // D5 — Steering RC channel
+#define PIN_RC_DIR    6   // D6 — Direction RC channel (fwd/rev)
+
+// CAN BUS
+#define CAN_CS        10  // D10
+#define CAN_INT       4   // D4
+
+// RELAY OUTPUTS
+#define PIN_RELAY1    7   // D7  — Direction relay 1 (forward)
+#define PIN_THR_SW    8   // D8  — Throttle switch relay (main enable)
+#define PIN_RELAY2    A0  // A0  — Direction relay 2 (reverse)
+
+// PWM OUTPUT
+#define PIN_THR_PWM   9   // D9  — Throttle PWM → R1(1k)/C1(1u) → thr_out → P2
+
+MCP_CAN CAN0(CAN_CS);
+
+// ================================================================
+// 2. CONSTANTS
+// ================================================================
+
+#define MOTOR_ID        1
+#define CAN_ID_CMD      (0x06000000 + MOTOR_ID)
+#define CAN_ID_FB       (0x05800000 + MOTOR_ID)
+#define CAN_BAUD        CAN_250KBPS
+#define MCP_CLOCK       MCP_8MHZ
+
+#define POSITION_SCALE  39L
+#define DEG_MIN         -540
+#define DEG_MAX          540
+
+static const uint16_t ARM_OFF_US     = 1200;
+static const uint16_t ARM_ON_US      = 1800;
+static const uint32_t FAILSAFE_US    = 250000; // 250ms
+static const uint32_t HB_TIMEOUT_MS  = 2000;
+
+// ================================================================
+// 3. STATE
+// ================================================================
+
+volatile uint32_t rcRiseTime[8]   = {0};
+volatile uint16_t rcPulse[8]      = {1500,1500,1100,1500,1500,1500,1500,1500};
+//                                  [0]  [1]  [2]arm[3]  [4]  [5]str[6]dir[7]
+volatile uint32_t rcLastMicros[8] = {0};
+volatile uint8_t  prevPinD        = 0;
+
+float    currentTargetAngle = 0.0f;
+float    motorAngle         = 0.0f;
+bool     motorEnabled       = false;
+bool     armed              = false;
+uint32_t lastHbMillis       = 0;
+
+// ================================================================
+// 4. PCINT2 ISR — all 4 RC channels simultaneously, no blocking
+// ================================================================
+
+ISR(PCINT2_vect) {
+  uint32_t now  = micros();
+  uint8_t  curD = PIND;
+  uint8_t  chg  = prevPinD ^ curD;
+  prevPinD      = curD;
+
+  const uint8_t pins[] = {PIN_RC_THR, PIN_RC_ARM, PIN_RC_STEER, PIN_RC_DIR};
+  for (uint8_t i = 0; i < 4; i++) {
+    uint8_t p    = pins[i];
+    uint8_t mask = (1 << p);
+    if (!(chg & mask)) continue;
+    if (curD & mask) {
+      rcRiseTime[p] = now;
+    } else {
+      uint32_t w = now - rcRiseTime[p];
+      if (w >= 900 && w <= 2100) {
+        rcPulse[p]      = (uint16_t)w;
+        rcLastMicros[p] = now;
+      }
+    }
+  }
+}
+
+// ================================================================
+// 5. TIMER1 PWM — 1 kHz on pin 9 (OC1A)
+// ================================================================
+
+void setupPwm1kHz() {
+  pinMode(PIN_THR_PWM, OUTPUT);
+  TCCR1A = (1<<WGM11) | (1<<COM1A1);
+  TCCR1B = (1<<WGM12) | (1<<WGM13) | (1<<CS11);
+  ICR1   = 1999;
+  OCR1A  = 0;
+}
+
+static inline void setDutyPercent(uint8_t d) {
+  OCR1A = (uint16_t)((uint32_t)ICR1 * constrain(d, 0, 100) / 100);
+}
+
+// ================================================================
+// 6. CAN HELPERS
+// ================================================================
+
+void sendCAN(uint32_t id, uint8_t data[8]) {
+  CAN0.sendMsgBuf(id, 1, 8, data);
+}
+
+void sendEnable() {
+  uint8_t en[8]  = {0x23,0x0D,0x20,0x01,0,0,0,0};
+  uint8_t pos[8] = {0x03,0x0D,0x20,0x31,0,0,0,0};
+  sendCAN(CAN_ID_CMD, en);  delay(2);
+  sendCAN(CAN_ID_CMD, pos);
+}
+
+void sendDisable() {
+  uint8_t dis[8] = {0x23,0x0C,0x20,0x01,0,0,0,0};
+  sendCAN(CAN_ID_CMD, dis);
+}
+
+void sendPosition(float deg) {
+  deg = constrain(deg, DEG_MIN, DEG_MAX);
+  long pos = (long)(-deg * POSITION_SCALE / 360.0f);
+  uint8_t f[8] = {0x23,0x02,0x20,0x01,
+    (uint8_t)(pos),(uint8_t)(pos>>8),(uint8_t)(pos>>16),(uint8_t)(pos>>24)};
+  sendCAN(CAN_ID_CMD, f);
+}
+
+void readFeedback() {
+  unsigned long id; byte len = 0; byte buf[8];
+  if (CAN0.checkReceive() != CAN_MSGAVAIL) return;
+  CAN0.readMsgBuf(&id, &len, buf);
+  if (id == CAN_ID_FB && len >= 8) {
+    long posInt = ((long)buf[7]<<24)|((long)buf[6]<<16)|((long)buf[5]<<8)|buf[4];
+    motorAngle  = -posInt * 360.0f / POSITION_SCALE;
+    lastHbMillis = millis();
+  }
+}
+
+// ================================================================
+// 7. SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_RC_THR,   INPUT);
+  pinMode(PIN_RC_ARM,   INPUT);
+  pinMode(PIN_RC_STEER, INPUT);
+  pinMode(PIN_RC_DIR,   INPUT);
+
+  pinMode(PIN_RELAY1,  OUTPUT); digitalWrite(PIN_RELAY1,  LOW);
+  pinMode(PIN_THR_SW,  OUTPUT); digitalWrite(PIN_THR_SW,  LOW);
+  pinMode(PIN_RELAY2,  OUTPUT); digitalWrite(PIN_RELAY2,  LOW);
+  setupPwm1kHz();
+  setDutyPercent(0);
+
+  // Enable PCINT2 for D2, D3, D5, D6
+  PCICR  |= (1 << PCIE2);
+  PCMSK2 |= (1<<PCINT18)|(1<<PCINT19)|(1<<PCINT21)|(1<<PCINT22);
+  prevPinD = PIND;
+
+  if (CAN0.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) == CAN_OK)
+    Serial.println("MCP2515 OK (250kbps, 8MHz)");
+  else
+    Serial.println("CAN init FAIL");
+  CAN0.setMode(MCP_NORMAL);
+  delay(200);
+
+  // Motor init sequence
+  uint8_t en[8]   = {0x23,0x0D,0x20,0x01,0,0,0,0};
+  uint8_t spd[8]  = {0x03,0x0D,0x20,0x11,0,0,0,0};
+  uint8_t spdv[8] = {0x23,0x00,0x20,0x01,100,0,0,0};
+  uint8_t pos[8]  = {0x03,0x0D,0x20,0x31,0,0,0,0};
+  sendCAN(CAN_ID_CMD, en);   delay(50);
+  sendCAN(CAN_ID_CMD, spd);  delay(10);
+  sendCAN(CAN_ID_CMD, spdv); delay(10);
+  sendCAN(CAN_ID_CMD, pos);  delay(100);
+  sendDisable();
+  Serial.println("KEYA: DISABLE sent");
+
+  lastHbMillis = millis();
+}
+
+// ================================================================
+// 8. LOOP
+// ================================================================
+
+void loop() {
+  // --- Atomic RC snapshot ---
+  uint16_t thr, arm, steer, dir;
+  uint32_t lastThr, lastArm;
+  noInterrupts();
+  thr     = rcPulse[PIN_RC_THR];
+  arm     = rcPulse[PIN_RC_ARM];
+  steer   = rcPulse[PIN_RC_STEER];
+  dir     = rcPulse[PIN_RC_DIR];
+  lastThr = rcLastMicros[PIN_RC_THR];
+  lastArm = rcLastMicros[PIN_RC_ARM];
+  interrupts();
+
+  uint32_t now   = micros();
+  bool     armOk = (now - lastArm) <= FAILSAFE_US;
+  bool     thrOk = (now - lastThr) <= FAILSAFE_US;
+
+  // --- Arm logic ---
+  bool newArmed = armed;
+  if      (!armOk)          newArmed = false;
+  else if (arm < ARM_OFF_US) newArmed = false;
+  else if (arm > ARM_ON_US)  newArmed = true;
+
+  if (newArmed && !armed) {
+    sendEnable();
+    motorEnabled = true;
+    Serial.println("ARMED -> sent ABS_POS_MODE + ENABLE");
+  } else if (!newArmed && armed) {
+    sendDisable();
+    motorEnabled = false;
+    digitalWrite(PIN_THR_SW, LOW);
+    digitalWrite(PIN_RELAY1,  LOW);
+    digitalWrite(PIN_RELAY2,  LOW);
+    setDutyPercent(0);
+    Serial.println("DISARM -> sent DISABLE");
+  }
+  armed = newArmed;
+
+  if (armed) {
+    // --- Throttle switch relay: ON when armed ---
+    digitalWrite(PIN_THR_SW, HIGH);
+
+    // --- Traction: left stick bidirectional from center ---
+    // thr center=1500, deadband=±50us, range=450us each side
+    static const int32_t THR_CENTER = 1500;
+    static const int32_t THR_DEAD   = 50;
+    static const int32_t THR_RANGE  = 450;
+
+    int32_t thr_rel = thrOk ? ((int32_t)thr - THR_CENTER) : 0;
+
+    if (thr_rel > THR_DEAD) {
+      // Forward
+      digitalWrite(PIN_RELAY1, HIGH);
+      digitalWrite(PIN_RELAY2, LOW);
+      setDutyPercent((uint8_t)constrain(thr_rel * 100 / THR_RANGE, 0, 100));
+    } else if (thr_rel < -THR_DEAD) {
+      // Reverse
+      digitalWrite(PIN_RELAY1, LOW);
+      digitalWrite(PIN_RELAY2, HIGH);
+      setDutyPercent((uint8_t)constrain(-thr_rel * 100 / THR_RANGE, 0, 100));
+    } else {
+      // Neutral deadband — stop
+      digitalWrite(PIN_RELAY1, LOW);
+      digitalWrite(PIN_RELAY2, LOW);
+      setDutyPercent(0);
+    }
+
+    // --- Steering CAN position ---
+    uint32_t lastSteer;
+    noInterrupts(); lastSteer = rcLastMicros[PIN_RC_STEER]; interrupts();
+    bool steerValid = (steer > 900 && steer < 2100) && (lastSteer > 0);
+    if (steerValid) {
+      if (abs((long)steer - 1500) < 30) steer = 1500;
+      float angle = (float)((long)steer - 1500) * 1.35f;
+      if (abs(angle - currentTargetAngle) >= 2.0f || angle == 0.0f)
+        currentTargetAngle = angle;
+    }
+    static uint32_t lastCanSend = 0;
+    if (millis() - lastCanSend > 20) {
+      lastCanSend = millis();
+      sendPosition(currentTargetAngle);
+    }
+
+  } else {
+    // Disarmed: keep sending disable, all relays off
+    static uint32_t lastDis = 0;
+    if (millis() - lastDis > 100) { lastDis = millis(); sendDisable(); }
+  }
+
+  // --- CAN feedback + heartbeat ---
+  readFeedback();
+  static uint32_t lastWarn = 0;
+  if (millis() - lastHbMillis > HB_TIMEOUT_MS && millis() - lastWarn > HB_TIMEOUT_MS) {
+    lastWarn = millis();
+    Serial.println("WARN: no heartbeat recently");
+  }
+
+  // --- Debug (500ms) ---
+  static uint32_t lastDebug = 0;
+  if (millis() - lastDebug > 500) {
+    lastDebug = millis();
+    Serial.print("RC thr=");  Serial.print(thr);
+    Serial.print(" arm=");    Serial.print(arm);
+    Serial.print(" steer=");  Serial.print(steer);
+    Serial.print(" relay=");  Serial.print(dir);
+    Serial.print(" -> deg="); Serial.println(currentTargetAngle, 2);
+  }
+}

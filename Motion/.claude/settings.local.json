@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(# Find setup and loop entry points *)",
+      "Read(//tmp/**)"
+    ]
+  }
+}
