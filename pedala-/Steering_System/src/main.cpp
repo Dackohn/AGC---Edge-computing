@@ -64,6 +64,16 @@ bool     motorEnabled       = false;
 bool     armed              = false;
 uint32_t lastHbMillis       = 0;
 
+// Serial command override (injected by mini computer agent)
+static char     cmdBuf[40]         = {0};
+static uint8_t  cmdLen             = 0;
+static uint16_t cmdThr             = 1500;
+static uint16_t cmdDir             = 1500;
+static uint16_t cmdSteer           = 1500;
+static uint16_t cmdArm             = 1000;  // default: disarmed
+static uint32_t cmdLastMs          = 0;
+static const uint32_t CMD_TIMEOUT_MS = 500; // fall back to RC after 500ms silence
+
 // ================================================================
 // 4. PCINT2 ISR — all 4 RC channels simultaneously, no blocking
 // ================================================================
@@ -147,7 +157,88 @@ void readFeedback() {
 }
 
 // ================================================================
-// 7. SETUP
+// 7. SERIAL COMMAND PARSER
+//    Single-char keys  (keyboard testing, no Enter needed):
+//      e/E  ARM          q/Q  DISARM+reset
+//      w/W  fwd+throttle↑    s/S  rev+throttle↑
+//      a/A  steer left        d/D  steer right
+//      SPC  stop (thr+dir neutral)   x/X  center steer
+//    CMD: line protocol (MQTT agent):
+//      CMD:<thr>,<dir>,<steer>,<arm>\n  →  ACK\n
+// ================================================================
+
+void parseSerialCmd() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    // Single-char keyboard commands — processed immediately, no Enter needed
+    switch (c) {
+      case 'e': case 'E':
+        cmdArm    = 2000;
+        cmdLastMs = millis();
+        continue;
+      case 'q': case 'Q':
+        cmdArm = 1000; cmdThr = 1500; cmdDir = 1500; cmdSteer = 1500;
+        cmdLastMs = millis();
+        continue;
+      case 'w': case 'W':
+        if (cmdDir != 1600) cmdThr = 1500;        // reset speed on direction change
+        cmdDir = 1600;
+        cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
+        cmdLastMs = millis();
+        continue;
+      case 's': case 'S':
+        if (cmdDir != 1400) cmdThr = 1500;
+        cmdDir = 1400;
+        cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
+        cmdLastMs = millis();
+        continue;
+      case 'a': case 'A':
+        cmdSteer  = max((uint16_t)1100, (uint16_t)(cmdSteer - 60));
+        cmdLastMs = millis();
+        continue;
+      case 'd': case 'D':
+        cmdSteer  = min((uint16_t)1900, (uint16_t)(cmdSteer + 60));
+        cmdLastMs = millis();
+        continue;
+      case ' ':
+        cmdThr = 1500; cmdDir = 1500;
+        cmdLastMs = millis();
+        continue;
+      case 'x': case 'X':
+        cmdSteer  = 1500;
+        cmdLastMs = millis();
+        continue;
+    }
+
+    // CMD: line protocol for MQTT agent
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        if (strncmp(cmdBuf, "CMD:", 4) == 0) {
+          unsigned int t, d, s, a;
+          if (sscanf(cmdBuf + 4, "%u,%u,%u,%u", &t, &d, &s, &a) == 4) {
+            if (t >= 900 && t <= 2100 && d >= 900 && d <= 2100 &&
+                s >= 900 && s <= 2100 && a >= 900 && a <= 2100) {
+              cmdThr   = (uint16_t)t;
+              cmdDir   = (uint16_t)d;
+              cmdSteer = (uint16_t)s;
+              cmdArm   = (uint16_t)a;
+              cmdLastMs = millis();
+              Serial.println("ACK");
+            }
+          }
+        }
+        cmdLen = 0;
+      }
+    } else if (cmdLen < 39) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+// ================================================================
+// 8. SETUP
 // ================================================================
 
 void setup() {
@@ -214,6 +305,17 @@ void loop() {
   bool     thrOk = (now - lastThr) <= FAILSAFE_US;
   bool     dirOk = (now - lastDir) <= FAILSAFE_US;
 
+  // --- Serial override (mini computer takes priority over RC when active) ---
+  parseSerialCmd();
+  bool serialActive = (millis() - cmdLastMs) < CMD_TIMEOUT_MS;
+  if (serialActive) {
+    thr   = cmdThr;
+    dir   = cmdDir;
+    steer = cmdSteer;
+    arm   = cmdArm;
+    armOk = thrOk = dirOk = true;
+  }
+
   // --- Arm logic ---
   bool newArmed = armed;
   if      (!armOk)          newArmed = false;
@@ -267,7 +369,7 @@ void loop() {
     // --- Steering CAN position ---
     uint32_t lastSteer;
     noInterrupts(); lastSteer = rcLastMicros[PIN_RC_STEER]; interrupts();
-    bool steerValid = (steer > 900 && steer < 2100) && (lastSteer > 0);
+    bool steerValid = (steer > 900 && steer < 2100) && (serialActive || lastSteer > 0);
     if (steerValid) {
       if (abs((long)steer - 1500) < 30) steer = 1500;
       float angle = (float)((long)steer - 1500) * 1.35f;
@@ -298,7 +400,8 @@ void loop() {
   static uint32_t lastDebug = 0;
   if (millis() - lastDebug > 500) {
     lastDebug = millis();
-    Serial.print("RC thr=");  Serial.print(thr);
+    Serial.print(serialActive ? "SER" : "RC");
+    Serial.print(" thr=");  Serial.print(thr);
     Serial.print(" arm=");    Serial.print(arm);
     Serial.print(" steer=");  Serial.print(steer);
     Serial.print(" relay=");  Serial.print(dir);
