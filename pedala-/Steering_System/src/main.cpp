@@ -256,11 +256,11 @@ void loop() {
 
     // --- Speed: thr stick controls PWM magnitude (center-return, 1500=stop) ---
     static const int32_t THR_DEAD  = 50;
-    static const int32_t THR_RANGE = 400;  // 1500+400=1900 = full speed
+    static const int32_t THR_RANGE = 250;  // 1500+250=1750 = top of control range
 
     int32_t thr_rel = thrOk ? ((int32_t)thr - 1500) : 0;
     uint8_t duty = (abs(thr_rel) > THR_DEAD)
-                   ? (uint8_t)constrain(abs(thr_rel) * 100 / THR_RANGE, 0, 100)
+                   ? (uint8_t)constrain(abs(thr_rel) * 60 / THR_RANGE, 0, 60)
                    : 0;
     setDutyPercent(duty);
 
