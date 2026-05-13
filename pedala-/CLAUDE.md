@@ -78,11 +78,11 @@ Connected to: MCP2515 CAN module, 3× KY-019 relay boards, RC receiver, Mini Com
 
 | Arduino Pin | Direction | Net     | Function                               |
 |-------------|-----------|---------|----------------------------------------|
-| D2          | INPUT     | thr     | RC throttle — left stick Y (speed+dir) |
+| D2          | INPUT     | thr     | RC throttle — speed magnitude axis     |
 | D3          | INPUT     | arm     | RC arm switch                          |
 | D4          | INPUT     | int     | MCP2515 INT (unused, polled instead)   |
 | D5          | INPUT     | steer   | RC steering — right stick X            |
-| D6          | INPUT     | dir     | RC dir channel (read, currently unused)|
+| D6          | INPUT     | dir     | RC direction axis — left stick fwd/rev |
 | D7          | OUTPUT    | relay1  | Forward relay (KY-019 U3)              |
 | D8          | OUTPUT    | thr_sw  | Throttle switch relay (KY-019 U5)      |
 | D9          | OUTPUT    | thr_pwm | Traction PWM (Timer1 OC1A, 1 kHz)     |
@@ -96,23 +96,31 @@ Connected to: MCP2515 CAN module, 3× KY-019 relay boards, RC receiver, Mini Com
 
 ## Current Arduino Control Logic
 
-### Arming
-- `arm > 1800µs` → ARMED (sends CAN enable + ABS_POS_MODE)
-- `arm < 1200µs` → DISARMED (all relays OFF, CAN disable)
+### Arming (arm, D3)
+- `arm > 1800µs` → ARMED (CAN enable + ABS_POS_MODE, thr_sw relay HIGH)
+- `arm < 1200µs` → DISARMED (all relays OFF, duty 0, CAN disable)
 - No arm signal >250ms → DISARMED (failsafe)
 
-### Traction (bidirectional from stick center)
-- Center = 1500µs, deadband ±50µs, range 450µs each side
-- `thr > 1550` → relay1 HIGH (forward), duty = `(thr−1500)×100/450`%
-- `thr < 1450` → relay2 HIGH (reverse), duty = `(1500−thr)×100/450`%
-- Inside deadband → both relays LOW, duty = 0%
-- `thr_sw` stays HIGH for entire armed period
+### Direction (dir, D6 — left stick direction axis)
+- Controls relay1/relay2, independent from speed
+- `dir > 1550` → relay1 HIGH (forward), relay2 LOW
+- `dir < 1450` → relay2 HIGH (reverse), relay1 LOW
+- `1450 ≤ dir ≤ 1550` → both relays LOW (neutral/coasting)
+- Deadband ±50µs around 1500
 
-### Steering (CAN position control, 50 Hz)
-- angle = `(steer − 1500) × 1.35` degrees
+### Speed (thr, D2 — throttle axis)
+- Controls PWM duty magnitude, independent from direction
+- Center-return stick, 1500µs = stop
+- `abs(thr − 1500) > 50` → duty = `abs(thr−1500) × 100 / 400`%
+- Inside deadband → duty = 0%
+- Range: ±400µs from center (1100–1900)
+- `thr_sw` relay (D8) stays HIGH for entire armed period
+
+### Steering (steer, D5 — CAN position control, 50 Hz)
+- angle = `(steer − 1500) × 1.35` degrees, clamped ±540°
 - Deadzone ±30µs → snapped to 0°
 - Only updates if angle change ≥2° (prevents motor hunting)
-- Ignored until first valid steer pulse received
+- Ignored until first valid steer pulse received (lastSteer > 0)
 
 ### Heartbeat
 - Prints `"WARN: no heartbeat recently"` if no CAN feedback for 2s
@@ -186,11 +194,12 @@ MQTT is the right choice because:
 ```json
 {
   "thr": 1700,
+  "dir": 1600,
   "steer": 1400,
   "arm": 2000
 }
 ```
-Values are RC-equivalent µs (1000–2000). Mini computer injects these into Arduino via Serial.
+Values are RC-equivalent µs (1000–2000). `thr` = speed magnitude, `dir` = forward/reverse selection. Mini computer injects these into Arduino via Serial.
 
 ### Telemetry Payload (vehicle → PC)
 ```json
@@ -208,8 +217,8 @@ Values are RC-equivalent µs (1000–2000). Mini computer injects these into Ard
 The Arduino currently only reads from the physical RC receiver. When the mini computer is in control, it must inject commands via Serial. A Serial command parser needs to be added to the firmware:
 
 ```
-Serial input format:  CMD:<thr>,<steer>,<arm>\n
-Example:              CMD:1700,1400,2000\n
+Serial input format:  CMD:<thr>,<dir>,<steer>,<arm>\n
+Example:              CMD:1700,1600,1400,2000\n
 Response:             ACK\n
 ```
 
@@ -275,7 +284,7 @@ def serial_reader_loop():
 ---
 
 ## Source Files
-- `CIUPACIUPS_314/src/main.cpp` — Arduino firmware (PlatformIO)
+- `Motion/Steering_System/src/main.cpp` — Arduino firmware (PlatformIO, current location)
 - `agent/agent.py` — mini computer MQTT↔Serial bridge (to be created)
 - `Schematic_shield-can_2026-04-29.svg` — full PCB schematic
 - `firmware_backup.hex` — binary dump from original working Arduino

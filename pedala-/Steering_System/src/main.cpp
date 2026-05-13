@@ -198,19 +198,21 @@ void setup() {
 void loop() {
   // --- Atomic RC snapshot ---
   uint16_t thr, arm, steer, dir;
-  uint32_t lastThr, lastArm;
+  uint32_t lastThr, lastDir, lastArm;
   noInterrupts();
   thr     = rcPulse[PIN_RC_THR];
   arm     = rcPulse[PIN_RC_ARM];
   steer   = rcPulse[PIN_RC_STEER];
   dir     = rcPulse[PIN_RC_DIR];
   lastThr = rcLastMicros[PIN_RC_THR];
+  lastDir = rcLastMicros[PIN_RC_DIR];
   lastArm = rcLastMicros[PIN_RC_ARM];
   interrupts();
 
   uint32_t now   = micros();
   bool     armOk = (now - lastArm) <= FAILSAFE_US;
   bool     thrOk = (now - lastThr) <= FAILSAFE_US;
+  bool     dirOk = (now - lastDir) <= FAILSAFE_US;
 
   // --- Arm logic ---
   bool newArmed = armed;
@@ -237,30 +239,30 @@ void loop() {
     // --- Throttle switch relay: ON when armed ---
     digitalWrite(PIN_THR_SW, HIGH);
 
-    // --- Traction: left stick bidirectional from center ---
-    // thr center=1500, deadband=±50us, range=450us each side
-    static const int32_t THR_CENTER = 1500;
-    static const int32_t THR_DEAD   = 50;
-    static const int32_t THR_RANGE  = 450;
+    // --- Direction: dir stick selects relay (forward / reverse) ---
+    static const int32_t DIR_DEAD = 50;
+    int32_t dir_rel = dirOk ? ((int32_t)dir - 1500) : 0;
 
-    int32_t thr_rel = thrOk ? ((int32_t)thr - THR_CENTER) : 0;
-
-    if (thr_rel > THR_DEAD) {
-      // Forward
-      digitalWrite(PIN_RELAY1, HIGH);
+    if (dir_rel > DIR_DEAD) {
+      digitalWrite(PIN_RELAY1, HIGH);  // forward
       digitalWrite(PIN_RELAY2, LOW);
-      setDutyPercent((uint8_t)constrain(thr_rel * 100 / THR_RANGE, 0, 100));
-    } else if (thr_rel < -THR_DEAD) {
-      // Reverse
+    } else if (dir_rel < -DIR_DEAD) {
       digitalWrite(PIN_RELAY1, LOW);
-      digitalWrite(PIN_RELAY2, HIGH);
-      setDutyPercent((uint8_t)constrain(-thr_rel * 100 / THR_RANGE, 0, 100));
+      digitalWrite(PIN_RELAY2, HIGH);  // reverse
     } else {
-      // Neutral deadband — stop
       digitalWrite(PIN_RELAY1, LOW);
-      digitalWrite(PIN_RELAY2, LOW);
-      setDutyPercent(0);
+      digitalWrite(PIN_RELAY2, LOW);   // neutral
     }
+
+    // --- Speed: thr stick controls PWM magnitude (center-return, 1500=stop) ---
+    static const int32_t THR_DEAD  = 50;
+    static const int32_t THR_RANGE = 400;  // 1500+400=1900 = full speed
+
+    int32_t thr_rel = thrOk ? ((int32_t)thr - 1500) : 0;
+    uint8_t duty = (abs(thr_rel) > THR_DEAD)
+                   ? (uint8_t)constrain(abs(thr_rel) * 100 / THR_RANGE, 0, 100)
+                   : 0;
+    setDutyPercent(duty);
 
     // --- Steering CAN position ---
     uint32_t lastSteer;
