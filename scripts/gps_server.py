@@ -2,10 +2,12 @@ import math
 import os
 import threading
 import time
+from typing import List
 
 import serial
 import serial.tools.list_ports
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymavlink import mavutil
 import uvicorn
@@ -27,21 +29,33 @@ ARDUINO_PORT  = os.getenv("ARDUINO_PORT", "COM7")
 ARDUINO_BAUD  = int(os.getenv("ARDUINO_BAUD", "115200"))
 
 ARRIVAL_RADIUS_M   = 3.0   # metres — stop when this close
-HEADING_DEADBAND   = 10.0  # degrees — steer only outside this band
-NAV_LOOP_HZ        = 2     # navigation update rate
+HEADING_DEADBAND   = 5.0   # degrees — steer only outside this band
+NAV_LOOP_HZ        = 4     # navigation update rate (Hz)
 
-# --- tuning ---
-# Each Arduino 'a'/'d' press = one steering increment.
-# Raise STEER_PULSES (e.g. 3) to turn the wheel more per tick.
-STEER_PULSES    = 1   # 1–5 recommended
+# --- steering geometry (EG2028KSF, confirmed by measurement) ---
+WHEELBASE_M        = 1.70  # metres (front axle → rear axle)
+MAX_WHEEL_DEG      = 30.0  # degrees (1.5 steering-wheel rotations = 30° wheel angle)
+STEERING_RATIO     = 18.0  # 1.5 turns × 360° / 30° = 18 : 1
+# min turning radius derived from geometry: R = L / tan(wheel_angle)
+import math as _math
+MIN_TURN_RADIUS_M  = round(WHEELBASE_M / _math.tan(_math.radians(MAX_WHEEL_DEG)), 3)
+# = 2.944 m
 
-# Each Arduino 'w' press = one throttle increment.
-# Raise THROTTLE_PULSES (e.g. 3) to go faster.
-THROTTLE_PULSES = 1   # 1–5 recommended
+# --- navigation tuning ---
+# PHASE 1: heading error > MAX_STEER_ANGLE → stop completely, turn in place
+# PHASE 2: heading error <= MAX_STEER_ANGLE → drive (throttle scales with alignment)
+MAX_STEER_ANGLE = 8    # degrees — must be aligned before moving (mirrors simulation)
 
-# If heading error exceeds this angle the wheel is at max rotation —
-# throttle relay is cut (STOP) until the car is aligned again.
-MAX_STEER_ANGLE = 70   # degrees — cut throttle beyond this (e.g. 60–120)
+# Steering pulses scale with heading error (proportional, like simulation)
+# To calibrate: count how many 'a'/'d' Arduino presses = full lock (30° wheel)
+# then set MAX_STEER_PULSES so full error sends roughly half that count per tick
+HIGH_ERR_DEG     = 45   # degrees — sends MAX_STEER_PULSES at this error or above
+MAX_STEER_PULSES = 3    # pulses per tick at full error
+MIN_STEER_PULSES = 1    # pulses per tick near MAX_STEER_ANGLE
+
+# Throttle scales with alignment
+MAX_THROTTLE_PULSES = 2   # pulses at perfect alignment
+MIN_THROTTLE_PULSES = 1   # pulses just past MAX_STEER_ANGLE
 
 # --- shared GPS state ---
 gps_data = {
@@ -63,12 +77,15 @@ FIX_TYPES = {
 
 # --- navigation state ---
 nav_state = {
-    "active":       False,
-    "target_lat":   None,
-    "target_lon":   None,
-    "distance_m":   None,
-    "heading_error": None,
-    "status":       "idle",   # idle | navigating | arrived | stopped
+    "active":         False,
+    "waypoints":      [],     # list of {"lat": float, "lon": float}
+    "wp_index":       0,      # current waypoint being driven toward
+    "wp_total":       0,
+    "target_lat":     None,
+    "target_lon":     None,
+    "distance_m":     None,
+    "heading_error":  None,
+    "status":         "idle", # idle | navigating | arrived | stopped
 }
 nav_lock  = threading.Lock()
 nav_event = threading.Event()   # set to wake/restart the nav loop
@@ -182,27 +199,38 @@ def normalise_angle(a: float) -> float:
 # --- navigation loop thread ---
 def navigation_loop():
     while True:
-        nav_event.wait()        # sleep until a /goto is issued
+        nav_event.wait()        # sleep until a /route is issued
         nav_event.clear()
 
         with nav_lock:
             if not nav_state["active"]:
                 continue
-            target_lat = nav_state["target_lat"]
-            target_lon = nav_state["target_lon"]
+            waypoints = list(nav_state["waypoints"])
 
-        print(f"[NAV] Starting navigation to {target_lat}, {target_lon}")
+        if not waypoints:
+            continue
+
+        print(f"[NAV] Starting route with {len(waypoints)} waypoints")
         arduino_send('e')       # ARM
         time.sleep(0.5)
 
-        interval = 1.0 / NAV_LOOP_HZ
-        was_turning = False     # track state to send STOP only once
+        interval    = 1.0 / NAV_LOOP_HZ
+        was_turning = False
+        wp_index    = 0
 
-        while True:
+        while wp_index < len(waypoints):
             # check if navigation was cancelled
             with nav_lock:
                 if not nav_state["active"]:
                     break
+
+            target_lat = waypoints[wp_index]["lat"]
+            target_lon = waypoints[wp_index]["lon"]
+
+            with nav_lock:
+                nav_state["wp_index"]  = wp_index
+                nav_state["target_lat"] = target_lat
+                nav_state["target_lon"] = target_lon
 
             with gps_lock:
                 cur_lat     = gps_data["lat"]
@@ -221,50 +249,78 @@ def navigation_loop():
                 nav_state["distance_m"] = round(dist, 2)
 
             if dist <= ARRIVAL_RADIUS_M:
-                print(f"[NAV] Arrived! Distance: {dist:.1f}m")
-                arduino_send(' ')   # STOP
-                time.sleep(0.2)
-                arduino_send('q')   # DISARM
-                with nav_lock:
-                    nav_state["active"] = False
-                    nav_state["status"] = "arrived"
-                break
-
-            # steer toward target
-            if cur_heading is not None:
-                heading_error = normalise_angle(bearing - cur_heading)
-                with nav_lock:
-                    nav_state["heading_error"] = round(heading_error, 1)
-
-                if heading_error > HEADING_DEADBAND:
-                    for _ in range(STEER_PULSES):
-                        arduino_send('d')   # steer right
-                elif heading_error < -HEADING_DEADBAND:
-                    for _ in range(STEER_PULSES):
-                        arduino_send('a')   # steer left
+                print(f"[NAV] Waypoint {wp_index + 1}/{len(waypoints)} reached — dist={dist:.1f}m")
+                wp_index += 1
+                if wp_index >= len(waypoints):
+                    arduino_send(' ')   # STOP
+                    time.sleep(0.2)
+                    arduino_send('q')   # DISARM
+                    with nav_lock:
+                        nav_state["active"] = False
+                        nav_state["status"] = "arrived"
+                    print("[NAV] Route complete.")
                 else:
-                    arduino_send('x')   # centre steer
+                    print(f"[NAV] Advancing to waypoint {wp_index + 1}/{len(waypoints)}")
+                continue
 
-            # cut throttle while wheel is at max rotation
-            if cur_heading is not None and abs(nav_state.get("heading_error") or 0) > MAX_STEER_ANGLE:
+            if cur_heading is None:
+                # no heading from Pixhawk yet — drive blind, centre wheel
+                arduino_send('x')
+                for _ in range(MIN_THROTTLE_PULSES):
+                    arduino_send('w')
+                time.sleep(interval)
+                continue
+
+            heading_error = normalise_angle(bearing - cur_heading)
+            with nav_lock:
+                nav_state["heading_error"] = round(heading_error, 1)
+
+            abs_err = abs(heading_error)
+
+            # ── PHASE 1: large error → stop and turn in place ─────────────
+            if abs_err > MAX_STEER_ANGLE:
                 if not was_turning:
-                    arduino_send(' ')   # STOP relay once on entry — turning in place
+                    arduino_send(' ')   # STOP throttle relay
                     was_turning = True
+
+                # proportional steering pulses: more pulses for bigger error
+                ratio  = min(abs_err / HIGH_ERR_DEG, 1.0)
+                pulses = round(MIN_STEER_PULSES + ratio * (MAX_STEER_PULSES - MIN_STEER_PULSES))
+                cmd    = 'd' if heading_error > 0 else 'a'
+                for _ in range(pulses):
+                    arduino_send(cmd)
+
                 print(
-                    f"[NAV] TURNING  dist={dist:.1f}m  bearing={bearing:.1f}°  "
-                    f"heading={cur_heading}°  err={nav_state['heading_error']}°"
+                    f"[NAV] TURNING  wp={wp_index + 1}/{len(waypoints)}  "
+                    f"dist={dist:.1f}m  err={heading_error:+.1f}°  pulses={pulses}{cmd}"
                 )
+
+            # ── PHASE 2: aligned → steer gently and drive ─────────────────
             else:
                 was_turning = False
-                for _ in range(THROTTLE_PULSES):
-                    arduino_send('w')   # forward
+
+                # fine steering inside deadband → centre; outside → 1 pulse
+                if heading_error > HEADING_DEADBAND:
+                    arduino_send('d')
+                elif heading_error < -HEADING_DEADBAND:
+                    arduino_send('a')
+                else:
+                    arduino_send('x')   # centre
+
+                # throttle scales with alignment: perfect → max pulses
+                align_ratio    = 1.0 - (abs_err / MAX_STEER_ANGLE) ** 2
+                throttle_pulses = max(MIN_THROTTLE_PULSES,
+                                      round(align_ratio * MAX_THROTTLE_PULSES))
+                for _ in range(throttle_pulses):
+                    arduino_send('w')
+
                 print(
-                    f"[NAV] dist={dist:.1f}m  bearing={bearing:.1f}°  "
-                    f"heading={cur_heading}°  err={nav_state['heading_error']}°"
+                    f"[NAV] DRIVING  wp={wp_index + 1}/{len(waypoints)}  "
+                    f"dist={dist:.1f}m  err={heading_error:+.1f}°  throttle={throttle_pulses}"
                 )
             time.sleep(interval)
 
-        # ensure vehicle is stopped after loop exits (arrival or cancel)
+        # ensure vehicle is stopped after loop exits
         arduino_send(' ')
         arduino_send('q')
         print("[NAV] Navigation ended.")
@@ -277,20 +333,36 @@ app = FastAPI(
         "GPS navigation server for the autonomous yard vehicle.\n\n"
         "- Reads live GPS from Pixhawk via MAVLink\n"
         "- Sends steering/throttle commands to Arduino Nano over serial\n"
-        "- Send `/goto` with a target coordinate to start autonomous navigation\n"
-        "- Send `/stop_nav` for emergency stop"
+        "- POST `/route` with a waypoint list to start autonomous navigation\n"
+        "- POST `/stop_nav` for emergency stop"
     ),
-    version="1.0.0",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-class GotoRequest(BaseModel):
+class Waypoint(BaseModel):
     lat: float
     lon: float
 
+
+class RouteRequest(BaseModel):
+    waypoints: List[Waypoint]
+
     model_config = {
         "json_schema_extra": {
-            "example": {"lat": 47.0621841, "lon": 28.8676635}
+            "example": {
+                "waypoints": [
+                    {"lat": 46.87436020327258, "lon": 29.23794936310003},
+                    {"lat": 46.89256329928182, "lon": 29.201891342736843},
+                ]
+            }
         }
     }
 
@@ -302,22 +374,35 @@ def get_gps():
         return dict(gps_data)
 
 
-@app.post("/goto", summary="Navigate to GPS coordinate", tags=["Navigation"])
-def goto(req: GotoRequest):
+@app.post("/route", summary="Navigate a multi-waypoint route", tags=["Navigation"])
+def route(req: RouteRequest):
     """
-    Start autonomous navigation to the given GPS coordinate.
-    The vehicle will ARM, steer toward the target and stop automatically within 3 m.
-    Sending a new `/goto` while navigating replaces the current target.
+    Start autonomous navigation through a list of GPS waypoints.
+    The vehicle will ARM, drive through each waypoint in order and stop at the last one.
+    Sending a new /route while navigating replaces the current route immediately.
     """
+    if len(req.waypoints) < 1:
+        return {"error": "at least one waypoint required"}
+
+    wps = [{"lat": wp.lat, "lon": wp.lon} for wp in req.waypoints]
+
     with nav_lock:
         nav_state["active"]        = True
-        nav_state["target_lat"]    = req.lat
-        nav_state["target_lon"]    = req.lon
+        nav_state["waypoints"]     = wps
+        nav_state["wp_index"]      = 0
+        nav_state["wp_total"]      = len(wps)
+        nav_state["target_lat"]    = wps[0]["lat"]
+        nav_state["target_lon"]    = wps[0]["lon"]
         nav_state["status"]        = "navigating"
         nav_state["distance_m"]    = None
         nav_state["heading_error"] = None
     nav_event.set()
-    return {"status": "navigation started", "target": {"lat": req.lat, "lon": req.lon}}
+    return {
+        "status":    "route started",
+        "waypoints": len(wps),
+        "first":     wps[0],
+        "last":      wps[-1],
+    }
 
 
 @app.post("/stop_nav", summary="Emergency stop", tags=["Navigation"])
@@ -333,17 +418,26 @@ def stop_nav():
 
 @app.get("/nav_status", summary="Navigation status", tags=["Navigation"])
 def nav_status():
-    """Returns current navigation state: active flag, target, distance remaining and heading error."""
+    """Returns current navigation state including waypoint progress."""
     with nav_lock:
-        return dict(nav_state)
+        return {
+            "active":        nav_state["active"],
+            "status":        nav_state["status"],
+            "wp_index":      nav_state["wp_index"],
+            "wp_total":      nav_state["wp_total"],
+            "target_lat":    nav_state["target_lat"],
+            "target_lon":    nav_state["target_lon"],
+            "distance_m":    nav_state["distance_m"],
+            "heading_error": nav_state["heading_error"],
+        }
 
 
 @app.get("/", include_in_schema=False)
 def root():
     return {
-        "status": "running",
-        "docs": "/docs",
-        "endpoints": ["/gps", "/goto", "/stop_nav", "/nav_status"],
+        "status":    "running",
+        "docs":      "/docs",
+        "endpoints": ["/gps", "/route", "/stop_nav", "/nav_status"],
     }
 
 
