@@ -35,7 +35,7 @@ class SensorProcessor:
         critical_distance_m: float = 1.0,
         warning_distance_m: float = 2.0,
         geofence_center: Tuple[float, float] = (47.0105, 28.8638),
-        geofence_radius_m: float = 100.0
+        geofence_radius_m: float = 100.0,
     ):
         self.critical_distance_m = critical_distance_m
         self.warning_distance_m = warning_distance_m
@@ -44,7 +44,9 @@ class SensorProcessor:
         self.last_gps: Optional[GPSData] = None
         self.state = VehicleState()
 
-    def haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    def haversine_distance(
+        self, lat1: float, lon1: float, lat2: float, lon2: float
+    ) -> float:
         r = 6371000.0
         phi1 = math.radians(lat1)
         phi2 = math.radians(lat2)
@@ -64,10 +66,7 @@ class SensorProcessor:
 
         center_lat, center_lon = self.geofence_center
         dist_from_center = self.haversine_distance(
-            gps.latitude,
-            gps.longitude,
-            center_lat,
-            center_lon
+            gps.latitude, gps.longitude, center_lat, center_lon
         )
         self.state.inside_geofence = dist_from_center <= self.geofence_radius_m
 
@@ -78,7 +77,7 @@ class SensorProcessor:
                     self.last_gps.latitude,
                     self.last_gps.longitude,
                     gps.latitude,
-                    gps.longitude
+                    gps.longitude,
                 )
                 self.state.speed_mps = traveled / dt
 
@@ -86,8 +85,7 @@ class SensorProcessor:
 
     def process_parktronic(self, park: ParktronicData) -> None:
         valid_distances = [
-            d for d in [park.front, park.rear]
-            if d is not None and d >= 0
+            d for d in [park.front, park.rear] if d is not None and d >= 0
         ]
 
         if not valid_distances:
@@ -122,7 +120,7 @@ class SensorProcessor:
             "longitude": self.state.longitude,
             "stop_required": stop_required,
             "slow_required": slow_required and not stop_required,
-            "geofence_violation": geofence_violation
+            "geofence_violation": geofence_violation,
         }
 
 
@@ -131,14 +129,14 @@ def simulate_sensor_input():
         GPSData(47.0105, 28.8638, time.time()),
         GPSData(47.01055, 28.86385, time.time() + 1),
         GPSData(47.01060, 28.86390, time.time() + 2),
-        GPSData(47.01150, 28.86550, time.time() + 3)
+        GPSData(47.01150, 28.86550, time.time() + 3),
     ]
 
     park_samples = [
         ParktronicData(front=3.2, rear=2.8),
         ParktronicData(front=1.7, rear=2.6),
         ParktronicData(front=0.8, rear=2.4),
-        ParktronicData(front=2.4, rear=2.3)
+        ParktronicData(front=2.4, rear=2.3),
     ]
 
     return list(zip(gps_samples, park_samples))
@@ -149,7 +147,7 @@ def main():
         critical_distance_m=1.0,
         warning_distance_m=2.0,
         geofence_center=(47.0105, 28.8638),
-        geofence_radius_m=150.0
+        geofence_radius_m=150.0,
     )
 
     for gps, park in simulate_sensor_input():

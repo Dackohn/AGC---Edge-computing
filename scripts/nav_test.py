@@ -7,15 +7,15 @@ Usage:
     python nav_test.py            (prompts for coordinates)
 """
 
+import json
 import math
+import os
 import sys
 import time
 import urllib.request
-import json
-import os
 
 GPS_SERVER = "http://localhost:8000/gps"
-ARRIVAL_M  = 3.0   # metres — "arrived" threshold
+ARRIVAL_M = 3.0  # metres — "arrived" threshold
 
 
 def get_gps():
@@ -31,25 +31,28 @@ def haversine(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a  = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def bearing(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2 - lon1)
-    x  = math.sin(dl) * math.cos(p2)
-    y  = math.cos(p1)*math.sin(p2) - math.sin(p1)*math.cos(p2)*math.cos(dl)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
 ARROWS = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
 
+
 def arrow(brng):
     idx = round(brng / 45) % 8
     return ARROWS[idx]
 
+
 COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
 
 def compass_dir(brng):
     idx = round(brng / 45) % 8
@@ -96,8 +99,8 @@ def main():
             time.sleep(1)
             continue
 
-        dist    = haversine(lat, lon, target_lat, target_lon)
-        brng    = bearing(lat, lon, target_lat, target_lon)
+        dist = haversine(lat, lon, target_lat, target_lon)
+        brng = bearing(lat, lon, target_lat, target_lon)
         heading = gps.get("heading_deg")
 
         print(f"\n  Current : {lat:.7f}, {lon:.7f}")
@@ -112,13 +115,17 @@ def main():
             print(f"  Direction: {arrow(brng)}  {compass_dir(brng)}  ({brng:.1f}°)")
             if heading is not None:
                 err = ((brng - heading) + 180) % 360 - 180
-                turn = "straight" if abs(err) < 10 else ("turn RIGHT" if err > 0 else "turn LEFT")
+                turn = (
+                    "straight"
+                    if abs(err) < 10
+                    else ("turn RIGHT" if err > 0 else "turn LEFT")
+                )
                 print(f"  Heading  : {heading:.1f}°   →  {turn}  ({err:+.1f}°)")
             print()
             # simple distance bar
-            bar_len  = 20
+            bar_len = 20
             progress = max(0, min(1, 1 - dist / max(dist, 50)))
-            filled   = int(progress * bar_len)
+            filled = int(progress * bar_len)
             print(f"  [{'#'*filled}{'.'*(bar_len-filled)}]  {dist:.1f}m left")
 
         print()

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """MQTT ↔ Serial bridge for AGC golf cart (mini computer side).
 
+Topics are namespaced per vehicle as agc/{VEHICLE_ID}/... to match the
+multi-vehicle dashboard backend.
+
 Subscribes to:
-  agc/command/manual          { direction, speed }  — from web dashboard
-  agc/command/emergency_stop  {}                    — from web dashboard
+  agc/{VEHICLE_ID}/command/manual          { direction, speed }  — from web dashboard
+  agc/{VEHICLE_ID}/command/emergency_stop  {}                    — from web dashboard
 
 Translates direction+speed → µs values → CMD:<thr>,<dir>,<steer>,<arm>\\n to Arduino.
 
 Reads Arduino serial output, parses debug lines, publishes to:
-  agc/vehicle/telemetry   { thr, arm, steer, relay, deg, armed, ts }
-  agc/vehicle/status      { message }
+  agc/{VEHICLE_ID}/telemetry   { thr, arm, steer, relay, deg, armed, ts }
+  agc/{VEHICLE_ID}/status      { message }
 """
 
 import json
@@ -30,19 +33,25 @@ load_dotenv(Path(__file__).parent / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("agc-agent")
 
-MQTT_BROKER    = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT      = int(os.environ.get("MQTT_PORT", "1883"))
-MQTT_USERNAME  = os.environ.get("MQTT_USERNAME", "")
-MQTT_PASSWORD  = os.environ.get("MQTT_PASSWORD", "")
-SERIAL_PORT    = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
-SERIAL_BAUD    = int(os.environ.get("SERIAL_BAUD", "115200"))
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
+VEHICLE_ID = os.environ.get("VEHICLE_ID", "vehicle")
+
+TOPIC_MANUAL = f"agc/{VEHICLE_ID}/command/manual"
+TOPIC_EMERGENCY_STOP = f"agc/{VEHICLE_ID}/command/emergency_stop"
+TOPIC_TELEMETRY = f"agc/{VEHICLE_ID}/telemetry"
+TOPIC_STATUS = f"agc/{VEHICLE_ID}/status"
 
 # Steering µs values → (steer - 1500) * 1.35 = motor degrees
-STEER_LEFT  = 1200   # -405° motor rotation
-STEER_RIGHT = 1800   # +405° motor rotation
-STEER_CTR   = 1500   #    0° (straight)
-ARM_ON      = 2000   # >1800 → ARMED
-ARM_OFF     = 1000   # <1200 → DISARMED
+STEER_LEFT = 1200  # -405° motor rotation
+STEER_RIGHT = 1800  # +405° motor rotation
+STEER_CTR = 1500  #    0° (straight)
+ARM_ON = 2000  # >1800 → ARMED
+ARM_OFF = 1000  # <1200 → DISARMED
 
 _ser: serial.Serial | None = None
 _mqtt_client: mqtt.Client | None = None
@@ -83,14 +92,22 @@ def on_mqtt_message(client, userdata, msg: mqtt.MQTTMessage) -> None:
     except Exception:
         return
 
-    if msg.topic == "agc/command/manual":
+    if msg.topic == TOPIC_MANUAL:
         direction = payload.get("direction", "stop")
-        speed     = float(payload.get("speed", 0.5))
+        speed = float(payload.get("speed", 0.5))
         thr, dir_us, steer, arm = direction_to_us(direction, speed)
         send_serial_cmd(thr, dir_us, steer, arm)
-        log.info("manual %-8s spd=%.2f → CMD:%d,%d,%d,%d", direction, speed, thr, dir_us, steer, arm)
+        log.info(
+            "manual %-8s spd=%.2f → CMD:%d,%d,%d,%d",
+            direction,
+            speed,
+            thr,
+            dir_us,
+            steer,
+            arm,
+        )
 
-    elif msg.topic == "agc/command/emergency_stop":
+    elif msg.topic == TOPIC_EMERGENCY_STOP:
         send_serial_cmd(1500, 1500, STEER_CTR, ARM_OFF)
         log.warning("EMERGENCY STOP sent to Arduino")
 
@@ -118,20 +135,20 @@ def serial_reader_loop() -> None:
             if m and _mqtt_client:
                 arm_us = int(m.group(2))
                 telemetry = {
-                    "thr":   int(m.group(1)),
-                    "arm":   arm_us,
+                    "thr": int(m.group(1)),
+                    "arm": arm_us,
                     "steer": int(m.group(3)),
                     "relay": int(m.group(4)),
-                    "deg":   float(m.group(5)),
+                    "deg": float(m.group(5)),
                     "armed": arm_us > 1800,
-                    "ts":    int(time.time() * 1000),
+                    "ts": int(time.time() * 1000),
                 }
-                _mqtt_client.publish("agc/vehicle/telemetry", json.dumps(telemetry))
+                _mqtt_client.publish(TOPIC_TELEMETRY, json.dumps(telemetry))
 
             # Forward status/warning lines to the dashboard
             if line.startswith(("ARMED", "DISARM", "WARN", "MCP", "CAN", "KEYA")):
                 if _mqtt_client:
-                    _mqtt_client.publish("agc/vehicle/status", json.dumps({"message": line}))
+                    _mqtt_client.publish(TOPIC_STATUS, json.dumps({"message": line}))
 
         except serial.SerialException as e:
             log.warning("serial read error: %s", e)
@@ -147,7 +164,9 @@ def main() -> None:
         _ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
         log.info("serial open: %s @ %d baud", SERIAL_PORT, SERIAL_BAUD)
     except serial.SerialException as e:
-        log.error("cannot open serial %s: %s — running without hardware", SERIAL_PORT, e)
+        log.error(
+            "cannot open serial %s: %s — running without hardware", SERIAL_PORT, e
+        )
 
     threading.Thread(target=serial_reader_loop, daemon=True).start()
 
@@ -158,12 +177,19 @@ def main() -> None:
     if MQTT_PORT == 8883:
         client.tls_set()
     client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    client.subscribe([
-        ("agc/command/manual", 0),
-        ("agc/command/emergency_stop", 0),
-    ])
+    client.subscribe(
+        [
+            (TOPIC_MANUAL, 0),
+            (TOPIC_EMERGENCY_STOP, 0),
+        ]
+    )
     _mqtt_client = client
-    log.info("MQTT connected %s:%d — waiting for commands", MQTT_BROKER, MQTT_PORT)
+    log.info(
+        "MQTT connected %s:%d — vehicle_id=%s — waiting for commands",
+        MQTT_BROKER,
+        MQTT_PORT,
+        VEHICLE_ID,
+    )
     client.loop_forever()
 
 

@@ -23,8 +23,9 @@ Usage
 """
 
 import sys
-import time
 import threading
+import time
+
 import serial
 import serial.tools.list_ports
 
@@ -35,17 +36,17 @@ except ImportError:
     sys.exit(1)
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-BAUD         = 115200
-SEND_HZ      = 20          # CMD sends per second
-THR_STEP     = 40          # µs per W/S press
-STEER_STEP   = 60          # µs per ←/→ press
-THR_CENTER   = 1500
+BAUD = 115200
+SEND_HZ = 20  # CMD sends per second
+THR_STEP = 40  # µs per W/S press
+STEER_STEP = 60  # µs per ←/→ press
+THR_CENTER = 1500
 STEER_CENTER = 1500
-DIR_FWD      = 1600
-DIR_REV      = 1400
-DIR_NEUTRAL  = 1500
-ARM_ON       = 2000
-ARM_OFF      = 1000
+DIR_FWD = 1600
+DIR_REV = 1400
+DIR_NEUTRAL = 1500
+ARM_ON = 2000
+ARM_OFF = 1000
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -64,10 +65,10 @@ def clamp(v, lo, hi):
 
 # shared state
 state = {
-    "thr":     THR_CENTER,
-    "dir":     DIR_NEUTRAL,
-    "steer":   STEER_CENTER,
-    "arm":     ARM_OFF,
+    "thr": THR_CENTER,
+    "dir": DIR_NEUTRAL,
+    "steer": STEER_CENTER,
+    "arm": ARM_OFF,
     "running": True,
 }
 lock = threading.Lock()
@@ -103,11 +104,14 @@ def reader_thread(ser):
 
 def print_status(s):
     armed_str = "ARMED   " if s["arm"] > 1800 else "DISARMED"
-    dir_str   = "FWD" if s["dir"] > 1550 else ("REV" if s["dir"] < 1450 else "NEU")
-    thr_pct   = abs(s["thr"] - THR_CENTER) * 100 // 400
-    deg       = (s["steer"] - STEER_CENTER) * 1.35
-    print(f"\r  [{armed_str}] thr={thr_pct:3d}%  dir={dir_str}  steer={deg:+.0f}°    ",
-          end="", flush=True)
+    dir_str = "FWD" if s["dir"] > 1550 else ("REV" if s["dir"] < 1450 else "NEU")
+    thr_pct = abs(s["thr"] - THR_CENTER) * 100 // 400
+    deg = (s["steer"] - STEER_CENTER) * 1.35
+    print(
+        f"\r  [{armed_str}] thr={thr_pct:3d}%  dir={dir_str}  steer={deg:+.0f}°    ",
+        end="",
+        flush=True,
+    )
 
 
 def main():
@@ -122,7 +126,7 @@ def main():
     except serial.SerialException as e:
         print(f"Cannot open port: {e}")
         sys.exit(1)
-    time.sleep(2)   # wait for Arduino reset after DTR toggle
+    time.sleep(2)  # wait for Arduino reset after DTR toggle
 
     print("""
 ╔══════════════════════════════════════════╗
@@ -150,25 +154,25 @@ def main():
 
             if key in (readchar.key.CTRL_C, readchar.key.CTRL_D):
                 break
-            elif key in ('e', 'E'):
+            elif key in ("e", "E"):
                 s["arm"] = ARM_ON
-            elif key in ('q', 'Q'):
+            elif key in ("q", "Q"):
                 s["arm"] = ARM_OFF
                 s["thr"] = THR_CENTER
                 s["dir"] = DIR_NEUTRAL
                 s["steer"] = STEER_CENTER
-            elif key in ('w', 'W'):
+            elif key in ("w", "W"):
                 s["thr"] = clamp(s["thr"] + THR_STEP, 1100, 1900)
-            elif key in ('s', 'S'):
+            elif key in ("s", "S"):
                 s["thr"] = clamp(s["thr"] - THR_STEP, 1100, 1900)
-            elif key in ('d', 'D'):
+            elif key in ("d", "D"):
                 s["dir"] = DIR_FWD
-            elif key in ('a', 'A'):
+            elif key in ("a", "A"):
                 s["dir"] = DIR_REV
-            elif key == ' ':
+            elif key == " ":
                 s["thr"] = THR_CENTER
                 s["dir"] = DIR_NEUTRAL
-            elif key in ('x', 'X'):
+            elif key in ("x", "X"):
                 s["thr"] = THR_CENTER
                 s["dir"] = DIR_NEUTRAL
             elif key == readchar.key.LEFT:
@@ -185,9 +189,15 @@ def main():
     finally:
         print("\nDisarming and closing …")
         with lock:
-            state.update({"arm": ARM_OFF, "thr": THR_CENTER,
-                          "dir": DIR_NEUTRAL, "steer": STEER_CENTER,
-                          "running": False})
+            state.update(
+                {
+                    "arm": ARM_OFF,
+                    "thr": THR_CENTER,
+                    "dir": DIR_NEUTRAL,
+                    "steer": STEER_CENTER,
+                    "running": False,
+                }
+            )
         time.sleep(0.4)
         ser.close()
         print("Done.")
