@@ -50,9 +50,10 @@ TOPIC_STATUS         = f"agc/{VEHICLE_ID}/status"
 # Navigation tuning
 ARRIVAL_RADIUS_M  = 3.0   # metres — consider waypoint reached within this distance
 HEADING_DEADBAND  = 10.0  # degrees — steer only outside this band
-MAX_STEER_ANGLE   = 70.0  # degrees — cut throttle while turning sharper than this
+MAX_STEER_ANGLE   = 180.0  # degrees — disabled (always drive forward while steering)
 NAV_LOOP_HZ       = 2     # navigation update rate
-NAV_SPEED         = 0.5   # 0.0–1.0 throttle during autonomous navigation
+NAV_SPEED         = 0.1   # 0.0–1.0 throttle during autonomous navigation
+MANUAL_SPEED      = 0.05  # 0.0–1.0 default manual speed (overridden by payload speed)
 
 # Steering µs — 0.5 rotations = 180° → steer = 1500 ± (180/1.35) = 1500 ± 133
 STEER_LEFT  = 1367   # -180° / -0.5 rotations
@@ -64,6 +65,12 @@ ARM_OFF     = 1000
 _ser: serial.Serial | None = None
 _mqtt_client: mqtt.Client | None = None
 _last_cmd_time: float = 0.0
+_manual_cmd: tuple[str, str] | None = None  # (throttle_char, steer_char) of last manual command
+
+# Steer position tracking — each 'a'/'d' = ±60µs from center 1500
+# 0.5 rotations = 180° → 133µs → max 2 presses; use 3 for margin
+STEER_MAX_PRESSES = 3
+_steer_pos: int = 0  # current steer offset in presses from center (-N to +N)
 
 # GPS state (populated by Pixhawk reader thread)
 _gps: dict = {"lat": None, "lon": None, "heading_deg": None, "speed": None, "satellites": None, "fix_type": None}
@@ -120,13 +127,19 @@ def direction_to_chars(direction: str) -> tuple[str, str]:
 
 
 def send_serial_cmd(thr: int, dir_us: int, steer: int, arm: int) -> None:
-    """Used by nav loop — translate µs values to chars."""
+    global _steer_pos
     if arm < 1200:
-        stop_vehicle(disarm=True)
+        send_char(" "); send_char("q")
+        _steer_pos = 0
         return
-    steer_char = "a" if steer < STEER_CTR else ("d" if steer > STEER_CTR else "x")
-    throttle_char = "w" if dir_us > 1550 else ("s" if dir_us < 1450 else " ")
-    drive(throttle_char, steer_char)
+    send_char("e")
+    if steer < STEER_CTR and _steer_pos > -STEER_MAX_PRESSES:
+        send_char("a"); _steer_pos -= 1
+    elif steer > STEER_CTR and _steer_pos < STEER_MAX_PRESSES:
+        send_char("d"); _steer_pos += 1
+    else:
+        send_char("x"); _steer_pos = 0
+    send_char("s" if dir_us > 1550 else ("w" if dir_us < 1450 else " "))
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +359,7 @@ def navigation_loop() -> None:
                     send_serial_cmd(1500, 1500, steer, ARM_ON)  # stop, keep steering
                 else:
                     was_turning = False
-                    send_serial_cmd(int(1500 + NAV_SPEED * 400), 1600, steer, ARM_ON)  # forward
+                    send_serial_cmd(int(1500 + NAV_SPEED * 400), 1400, steer, ARM_ON)  # forward
                     log.info("NAV dist=%.1fm bearing=%.1f° heading=%s° err=%.1f°",
                              dist, bearing, cur_heading, heading_error)
 
@@ -356,12 +369,13 @@ def navigation_loop() -> None:
                 if not _nav["active"]:
                     break
 
-        # Mission complete or cancelled
-        send_serial_cmd(1500, 1500, STEER_CTR, ARM_OFF)  # stop + disarm
+        # Mission complete or cancelled — only disarm if not immediately replaced by new mission
         with _nav_lock:
             active = _nav["active"]
             _nav["active"] = False
             _nav["status"] = "arrived" if active else "stopped"
+        if not _nav_event.is_set():  # no new mission queued
+            send_serial_cmd(1500, 1500, STEER_CTR, ARM_OFF)  # stop + disarm
 
         msg = "Mission complete" if active else "Navigation cancelled"
         log.info("NAV %s", msg)
@@ -388,14 +402,25 @@ def on_mqtt_message(client, userdata, msg: mqtt.MQTTMessage) -> None:
         with _nav_lock:
             _nav["active"] = False
 
+        global _manual_cmd
         direction = payload.get("direction", "stop")
-        speed     = float(payload.get("speed", 0.5))
-        throttle_char, steer_char = direction_to_chars(direction)
-        if throttle_char == " ":
-            stop_vehicle()
+        speed     = float(payload.get("speed", MANUAL_SPEED))
+        spd_us    = int(1500 + max(0.0, min(1.0, speed)) * 400)
+
+        match direction:
+            case "forward":  thr, dir_us, steer = spd_us, 1400, STEER_CTR
+            case "backward": thr, dir_us, steer = spd_us, 1600, STEER_CTR
+            case "left":     thr, dir_us, steer = spd_us, 1400, STEER_LEFT
+            case "right":    thr, dir_us, steer = spd_us, 1400, STEER_RIGHT
+            case _:          thr, dir_us, steer = 1500,   1500, STEER_CTR
+
+        if direction == "stop":
+            _manual_cmd = None
+            send_serial_cmd(1500, 1500, STEER_CTR, ARM_ON)
         else:
-            drive(throttle_char, steer_char)
-        log.info("manual %-8s spd=%.2f → %r/%r", direction, speed, throttle_char, steer_char)
+            _manual_cmd = (thr, dir_us, steer, ARM_ON)
+            send_serial_cmd(thr, dir_us, steer, ARM_ON)
+        log.info("manual %-8s spd=%.2f → CMD:%d,%d,%d,%d", direction, speed, thr, dir_us, steer, ARM_ON)
 
     elif msg.topic == TOPIC_MISSION:
         waypoints = payload.get("waypoints", [])
@@ -446,7 +471,8 @@ def serial_reader_loop() -> None:
             if not raw:
                 continue
             line = raw.decode(errors="replace").strip()
-            log.debug("arduino: %s", line)
+            if line:
+                log.info("arduino ← %s", line)
 
             m = _DEBUG_RE.match(line)
             if m and _mqtt_client:
@@ -478,14 +504,19 @@ def serial_reader_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def heartbeat_loop() -> None:
-    """Send a neutral hold every 200ms so Arduino doesn't hit its 500ms failsafe."""
+    """Repeat last manual command every 200ms so Arduino doesn't hit 500ms failsafe."""
     global _last_cmd_time
     while True:
-        time.sleep(0.2)
+        time.sleep(0.08)
+        if _emergency.is_set():
+            continue
         with _nav_lock:
             nav_active = _nav["active"]
         if not nav_active and (time.time() - _last_cmd_time) > 0.2:
-            send_char("e")  # keep armed, no movement
+            if _manual_cmd is not None:
+                send_serial_cmd(*_manual_cmd)  # repeat last manual command
+            else:
+                send_serial_cmd(1500, 1500, STEER_CTR, ARM_ON)  # hold, stay armed
             _last_cmd_time = time.time()
 
 
