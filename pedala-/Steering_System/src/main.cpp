@@ -60,6 +60,9 @@ volatile uint8_t  prevPinD        = 0;
 
 float    currentTargetAngle = 0.0f;
 float    motorAngle         = 0.0f;
+// Steering center calibration: if wheels aren't straight at 1500µs RC / steer=1500,
+// adjust this until they are. Positive = motor turns right to reach "straight".
+static float STEER_CENTER_DEG = 0.0f;
 bool     motorEnabled       = false;
 bool     armed              = false;
 uint32_t lastHbMillis       = 0;
@@ -171,48 +174,8 @@ void parseSerialCmd() {
   while (Serial.available()) {
     char c = (char)Serial.read();
 
-    // Single-char keyboard commands — processed immediately, no Enter needed
-    switch (c) {
-      case 'e': case 'E':
-        cmdArm    = 2000;
-        cmdLastMs = millis();
-        continue;
-      case 'q': case 'Q':
-        cmdArm = 1000; cmdThr = 1500; cmdDir = 1500; cmdSteer = 1500;
-        cmdLastMs = millis();
-        continue;
-      case 'w': case 'W':
-        if (cmdDir != 1600) cmdThr = 1500;        // reset speed on direction change
-        cmdDir = 1600;
-        cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
-        cmdLastMs = millis();
-        continue;
-      case 's': case 'S':
-        if (cmdDir != 1400) cmdThr = 1500;
-        cmdDir = 1400;
-        cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
-        cmdLastMs = millis();
-        continue;
-      case 'a': case 'A':
-        cmdSteer  = max((uint16_t)1100, (uint16_t)(cmdSteer - 60));
-        cmdLastMs = millis();
-        continue;
-      case 'd': case 'D':
-        cmdSteer  = min((uint16_t)1900, (uint16_t)(cmdSteer + 60));
-        cmdLastMs = millis();
-        continue;
-      case ' ':
-        cmdThr = 1500; cmdDir = 1500;
-        cmdLastMs = millis();
-        continue;
-      case 'x': case 'X':
-        cmdSteer  = 1500;
-        cmdLastMs = millis();
-        continue;
-    }
-
-    // CMD: line protocol for MQTT agent
     if (c == '\n' || c == '\r') {
+      // End of line — try to parse CMD: line
       if (cmdLen > 0) {
         cmdBuf[cmdLen] = '\0';
         if (strncmp(cmdBuf, "CMD:", 4) == 0) {
@@ -220,10 +183,10 @@ void parseSerialCmd() {
           if (sscanf(cmdBuf + 4, "%u,%u,%u,%u", &t, &d, &s, &a) == 4) {
             if (t >= 900 && t <= 2100 && d >= 900 && d <= 2100 &&
                 s >= 900 && s <= 2100 && a >= 900 && a <= 2100) {
-              cmdThr   = (uint16_t)t;
-              cmdDir   = (uint16_t)d;
-              cmdSteer = (uint16_t)s;
-              cmdArm   = (uint16_t)a;
+              cmdThr    = (uint16_t)t;
+              cmdDir    = (uint16_t)d;
+              cmdSteer  = (uint16_t)s;
+              cmdArm    = (uint16_t)a;
               cmdLastMs = millis();
               Serial.println("ACK");
             }
@@ -231,8 +194,54 @@ void parseSerialCmd() {
         }
         cmdLen = 0;
       }
-    } else if (cmdLen < 39) {
-      cmdBuf[cmdLen++] = c;
+    } else if (cmdLen > 0) {
+      // Mid-line: accumulate only — no single-char processing
+      // (prevents 'D' in "CMD:" from firing steer-right, etc.)
+      if (cmdLen < 39) cmdBuf[cmdLen++] = c;
+    } else {
+      // Start of a new line: single-char keyboard commands (for bench testing)
+      switch (c) {
+        case 'e': case 'E':
+          cmdArm    = 2000;
+          cmdLastMs = millis();
+          break;
+        case 'q': case 'Q':
+          cmdArm = 1000; cmdThr = 1500; cmdDir = 1500; cmdSteer = 1500;
+          cmdLastMs = millis();
+          break;
+        case 'w': case 'W':
+          if (cmdDir != 1600) cmdThr = 1500;
+          cmdDir = 1600;
+          cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
+          cmdLastMs = millis();
+          break;
+        case 's': case 'S':
+          if (cmdDir != 1400) cmdThr = 1500;
+          cmdDir = 1400;
+          cmdThr = min((uint16_t)1900, (uint16_t)(cmdThr + 40));
+          cmdLastMs = millis();
+          break;
+        case 'a': case 'A':
+          cmdSteer  = max((uint16_t)1100, (uint16_t)(cmdSteer - 60));
+          cmdLastMs = millis();
+          break;
+        case 'd': case 'D':
+          cmdSteer  = min((uint16_t)1900, (uint16_t)(cmdSteer + 60));
+          cmdLastMs = millis();
+          break;
+        case ' ':
+          cmdThr = 1500; cmdDir = 1500;
+          cmdLastMs = millis();
+          break;
+        case 'x': case 'X':
+          cmdSteer  = 1500;
+          cmdLastMs = millis();
+          break;
+        default:
+          // Start accumulating a multi-char line (e.g. "CMD:...")
+          cmdBuf[cmdLen++] = c;
+          break;
+      }
     }
   }
 }
@@ -359,10 +368,11 @@ void loop() {
     // --- Speed: thr stick controls PWM magnitude (center-return, 1500=stop) ---
     static const int32_t THR_DEAD  = 50;
     static const int32_t THR_RANGE = 250;  // 1500+250=1750 = top of control range
+    static const uint8_t MAX_DUTY  = 40;    // hard cap ~1-2 km/h; raise if too slow
 
     int32_t thr_rel = thrOk ? ((int32_t)thr - 1500) : 0;
     uint8_t duty = (abs(thr_rel) > THR_DEAD)
-                   ? (uint8_t)constrain(abs(thr_rel) * 60 / THR_RANGE, 0, 60)
+                   ? (uint8_t)constrain(abs(thr_rel) * MAX_DUTY / THR_RANGE, 0, MAX_DUTY)
                    : 0;
     setDutyPercent(duty);
 
@@ -379,7 +389,7 @@ void loop() {
     static uint32_t lastCanSend = 0;
     if (millis() - lastCanSend > 20) {
       lastCanSend = millis();
-      sendPosition(currentTargetAngle);
+      sendPosition(currentTargetAngle + STEER_CENTER_DEG);
     }
 
   } else {

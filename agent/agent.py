@@ -47,13 +47,14 @@ TOPIC_HOME           = f"agc/{VEHICLE_ID}/command/home"
 TOPIC_TELEMETRY      = f"agc/{VEHICLE_ID}/telemetry"
 TOPIC_STATUS         = f"agc/{VEHICLE_ID}/status"
 
-# Navigation tuning
-ARRIVAL_RADIUS_M  = 3.0   # metres — consider waypoint reached within this distance
-HEADING_DEADBAND  = 10.0  # degrees — steer only outside this band
-MAX_STEER_ANGLE   = 180.0  # degrees — disabled (always drive forward while steering)
-NAV_LOOP_HZ       = 2     # navigation update rate
-NAV_SPEED         = 0.1   # 0.0–1.0 throttle during autonomous navigation
-MANUAL_SPEED      = 0.05  # 0.0–1.0 default manual speed (overridden by payload speed)
+# Navigation tuning (overridable via .env)
+ARRIVAL_RADIUS_M  = float(os.environ.get("ARRIVAL_RADIUS_M", "3.0"))
+HEADING_DEADBAND  = float(os.environ.get("HEADING_DEADBAND", "10.0"))
+MAX_STEER_ANGLE   = float(os.environ.get("MAX_STEER_ANGLE",  "30.0"))
+NAV_LOOP_HZ       = int(os.environ.get("NAV_LOOP_HZ",        "5"))
+NAV_SPEED         = float(os.environ.get("NAV_SPEED",         "0.1"))
+MANUAL_SPEED      = float(os.environ.get("MANUAL_SPEED",      "0.05"))
+MANUAL_SPEED_MAX  = float(os.environ.get("MANUAL_SPEED_MAX",  "0.15"))
 
 # Steering µs — 0.5 rotations = 180° → steer = 1500 ± (180/1.35) = 1500 ± 133
 STEER_LEFT  = 1367   # -180° / -0.5 rotations
@@ -69,9 +70,6 @@ _manual_cmd: tuple[str, str] | None = None  # (throttle_char, steer_char) of las
 
 # Steer position tracking — each 'a'/'d' = ±60µs from center 1500
 # 0.5 rotations = 180° → 133µs → max 2 presses; use 3 for margin
-STEER_MAX_PRESSES = 3
-_steer_pos: int = 0  # current steer offset in presses from center (-N to +N)
-
 # GPS state (populated by Pixhawk reader thread)
 _gps: dict = {"lat": None, "lon": None, "heading_deg": None, "speed": None, "satellites": None, "fix_type": None}
 _gps_lock = threading.Lock()
@@ -109,10 +107,8 @@ def drive(direction: str, steer: str = "x") -> None:
 
 
 def stop_vehicle(disarm: bool = False) -> None:
-    send_char(" ")     # stop throttle
-    send_char("x")     # centre steer
-    if disarm:
-        send_char("q")  # DISARM
+    arm = ARM_OFF if disarm else ARM_ON
+    send_serial_cmd(1500, 1500, STEER_CTR, arm)
 
 
 def direction_to_chars(direction: str) -> tuple[str, str]:
@@ -127,19 +123,15 @@ def direction_to_chars(direction: str) -> tuple[str, str]:
 
 
 def send_serial_cmd(thr: int, dir_us: int, steer: int, arm: int) -> None:
-    global _steer_pos
-    if arm < 1200:
-        send_char(" "); send_char("q")
-        _steer_pos = 0
+    """Send a CMD: line to the Arduino — sets absolute µs values immediately."""
+    if _ser is None or not _ser.is_open:
+        log.debug("no serial — would send CMD:%d,%d,%d,%d", thr, dir_us, steer, arm)
         return
-    send_char("e")
-    if steer < STEER_CTR and _steer_pos > -STEER_MAX_PRESSES:
-        send_char("a"); _steer_pos -= 1
-    elif steer > STEER_CTR and _steer_pos < STEER_MAX_PRESSES:
-        send_char("d"); _steer_pos += 1
-    else:
-        send_char("x"); _steer_pos = 0
-    send_char("s" if dir_us > 1550 else ("w" if dir_us < 1450 else " "))
+    line = f"CMD:{thr},{dir_us},{steer},{arm}\n"
+    try:
+        _ser.write(line.encode())
+    except serial.SerialException as e:
+        log.warning("serial write error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +216,8 @@ def pixhawk_reader_loop() -> None:
                             _computed_heading = _bearing(prev_lat, prev_lon, lat, lon)
                     _prev_gps_pos = (lat, lon)
                 else:
-                    _prev_gps_pos = None  # reset when stopped so stale delta isn't used
+                    _prev_gps_pos = None
+                    _computed_heading = None  # clear stale track so compass takes over when stopped
 
                 now = time.time()
                 if now - last_log >= LOG_INTERVAL:
@@ -335,8 +328,9 @@ def navigation_loop() -> None:
 
                 spd_us = int(1500 + NAV_SPEED * 400)
 
-                # Use GPS-computed heading (from position delta) — reliable when moving
-                # Fall back to compass only if computed heading not yet available
+                # Compass (cur_heading) is available immediately and works from standstill.
+                # GPS-computed heading (from position delta) is more accurate when moving but
+                # needs the vehicle to have travelled >0.5 m — use it only then.
                 effective_heading = _computed_heading if _computed_heading is not None else cur_heading
 
                 if effective_heading is not None:
@@ -361,7 +355,9 @@ def navigation_loop() -> None:
                     was_turning = False
                     send_serial_cmd(int(1500 + NAV_SPEED * 400), 1400, steer, ARM_ON)  # forward
                     log.info("NAV dist=%.1fm bearing=%.1f° heading=%s° err=%.1f°",
-                             dist, bearing, cur_heading, heading_error)
+                             dist, bearing,
+                             f"{effective_heading:.1f}" if effective_heading is not None else "?",
+                             heading_error)
 
                 time.sleep(interval)
 
@@ -404,8 +400,8 @@ def on_mqtt_message(client, userdata, msg: mqtt.MQTTMessage) -> None:
 
         global _manual_cmd
         direction = payload.get("direction", "stop")
-        speed     = float(payload.get("speed", MANUAL_SPEED))
-        spd_us    = int(1500 + max(0.0, min(1.0, speed)) * 400)
+        speed     = max(0.0, min(1.0, float(payload.get("speed", 0.5))))
+        spd_us    = int(1500 + speed * 400)
 
         match direction:
             case "forward":  thr, dir_us, steer = spd_us, 1400, STEER_CTR
@@ -515,8 +511,7 @@ def heartbeat_loop() -> None:
         if not nav_active and (time.time() - _last_cmd_time) > 0.2:
             if _manual_cmd is not None:
                 send_serial_cmd(*_manual_cmd)  # repeat last manual command
-            else:
-                send_serial_cmd(1500, 1500, STEER_CTR, ARM_ON)  # hold, stay armed
+            # else: idle — send nothing so Arduino CMD timeout expires and RC takes over
             _last_cmd_time = time.time()
 
 
