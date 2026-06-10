@@ -1,4 +1,4 @@
-// --- NANO #2: CAN DRIVER (RC RECEIVER) + TRACTION CONTROL (PWM) ---
+﻿// --- NANO #2: CAN DRIVER (RC RECEIVER) + TRACTION CONTROL (PWM) ---
 // Reconstructed from firmware binary + schematic Schematic_shield-can_2026-04-29
 #include <Arduino.h>
 #include <SPI.h>
@@ -9,23 +9,23 @@
 // 1. PIN DEFINITIONS  (verified against schematic)
 // ================================================================
 
-// RC INPUTS — all on Port D, read via PCINT2
-#define PIN_RC_THR    2   // D2 — Throttle RC channel
-#define PIN_RC_ARM    3   // D3 — Arm switch RC channel
-#define PIN_RC_STEER  5   // D5 — Steering RC channel
-#define PIN_RC_DIR    6   // D6 — Direction RC channel (fwd/rev)
+// RC INPUTS вЂ” all on Port D, read via PCINT2
+#define PIN_RC_THR    6   // D2 вЂ” Throttle RC channel
+#define PIN_RC_ARM    3   // D3 вЂ” Arm switch RC channel
+#define PIN_RC_STEER  5   // D5 вЂ” Steering RC channel
+#define PIN_RC_DIR    9   // D6 вЂ” Direction RC channel (fwd/rev)
 
 // CAN BUS
 #define CAN_CS        10  // D10
 #define CAN_INT       4   // D4
 
 // RELAY OUTPUTS
-#define PIN_RELAY1    7   // D7  — Direction relay 1 (forward)
-#define PIN_THR_SW    8   // D8  — Throttle switch relay (main enable)
-#define PIN_RELAY2    A0  // A0  — Direction relay 2 (reverse)
+#define PIN_RELAY1    7   // D7  вЂ” Direction relay 1 (forward)
+#define PIN_THR_SW    8   // D8  вЂ” Throttle switch relay (main enable)
+#define PIN_RELAY2    A0  // A0  вЂ” Direction relay 2 (reverse)
 
 // PWM OUTPUT
-#define PIN_THR_PWM   9   // D9  — Throttle PWM → R1(1k)/C1(1u) → thr_out → P2
+#define PIN_THR_PWM   9   // D9  вЂ” Throttle PWM в†’ R1(1k)/C1(1u) в†’ thr_out в†’ P2
 
 MCP_CAN CAN0(CAN_CS);
 
@@ -40,8 +40,8 @@ MCP_CAN CAN0(CAN_CS);
 #define MCP_CLOCK       MCP_8MHZ
 
 #define POSITION_SCALE  39L
-#define DEG_MIN         -540
-#define DEG_MAX          540
+#define DEG_MIN         -1080
+#define DEG_MAX          1080
 
 static const uint16_t ARM_OFF_US     = 1200;
 static const uint16_t ARM_ON_US      = 1800;
@@ -53,18 +53,20 @@ static const uint32_t HB_TIMEOUT_MS  = 2000;
 // ================================================================
 
 volatile uint32_t rcRiseTime[8]   = {0};
-volatile uint16_t rcPulse[8]      = {1500,1500,1100,1500,1500,1500,1500,1500};
+volatile uint16_t rcPulse[8]      = {1500,1500, 500,1100,1500,1500, 500,1500};
+//                                   [0]  [1] [2]thr [3]arm  [4]  [5]str [6]thr [7]
 //                                  [0]  [1]  [2]arm[3]  [4]  [5]str[6]dir[7]
 volatile uint32_t rcLastMicros[8] = {0};
 volatile uint8_t  prevPinD        = 0;
 
 float    currentTargetAngle = 0.0f;
 float    motorAngle         = 0.0f;
-// Steering center calibration: if wheels aren't straight at 1500µs RC / steer=1500,
+// Steering center calibration: if wheels aren't straight at 1500Вµs RC / steer=1500,
 // adjust this until they are. Positive = motor turns right to reach "straight".
 static float STEER_CENTER_DEG = 0.0f;
 bool     motorEnabled       = false;
 bool     armed              = false;
+static int8_t relayState   = 0;   // 0=coast 1=fwd -1=rev
 uint32_t lastHbMillis       = 0;
 
 // Serial command override (injected by mini computer agent)
@@ -78,7 +80,7 @@ static uint32_t cmdLastMs          = 0;
 static const uint32_t CMD_TIMEOUT_MS = 500; // fall back to RC after 500ms silence
 
 // ================================================================
-// 4. PCINT2 ISR — all 4 RC channels simultaneously, no blocking
+// 4. PCINT2 ISR вЂ” all 4 RC channels simultaneously, no blocking
 // ================================================================
 
 ISR(PCINT2_vect) {
@@ -96,7 +98,8 @@ ISR(PCINT2_vect) {
       rcRiseTime[p] = now;
     } else {
       uint32_t w = now - rcRiseTime[p];
-      if (w >= 900 && w <= 2100) {
+      bool valid = (w >= 100 && w <= 2100);
+      if (valid) {
         rcPulse[p]      = (uint16_t)w;
         rcLastMicros[p] = now;
       }
@@ -105,7 +108,7 @@ ISR(PCINT2_vect) {
 }
 
 // ================================================================
-// 5. TIMER1 PWM — 1 kHz on pin 9 (OC1A)
+// 5. TIMER1 PWM вЂ” 1 kHz on pin 9 (OC1A)
 // ================================================================
 
 void setupPwm1kHz() {
@@ -163,11 +166,11 @@ void readFeedback() {
 // 7. SERIAL COMMAND PARSER
 //    Single-char keys  (keyboard testing, no Enter needed):
 //      e/E  ARM          q/Q  DISARM+reset
-//      w/W  fwd+throttle↑    s/S  rev+throttle↑
+//      w/W  fwd+throttleв†‘    s/S  rev+throttleв†‘
 //      a/A  steer left        d/D  steer right
 //      SPC  stop (thr+dir neutral)   x/X  center steer
 //    CMD: line protocol (MQTT agent):
-//      CMD:<thr>,<dir>,<steer>,<arm>\n  →  ACK\n
+//      CMD:<thr>,<dir>,<steer>,<arm>\n  в†’  ACK\n
 // ================================================================
 
 void parseSerialCmd() {
@@ -175,7 +178,7 @@ void parseSerialCmd() {
     char c = (char)Serial.read();
 
     if (c == '\n' || c == '\r') {
-      // End of line — try to parse CMD: line
+      // End of line вЂ” try to parse CMD: line
       if (cmdLen > 0) {
         cmdBuf[cmdLen] = '\0';
         if (strncmp(cmdBuf, "CMD:", 4) == 0) {
@@ -195,7 +198,7 @@ void parseSerialCmd() {
         cmdLen = 0;
       }
     } else if (cmdLen > 0) {
-      // Mid-line: accumulate only — no single-char processing
+      // Mid-line: accumulate only вЂ” no single-char processing
       // (prevents 'D' in "CMD:" from firing steer-right, etc.)
       if (cmdLen < 39) cmdBuf[cmdLen++] = c;
     } else {
@@ -311,8 +314,6 @@ void loop() {
 
   uint32_t now   = micros();
   bool     armOk = (now - lastArm) <= FAILSAFE_US;
-  bool     thrOk = (now - lastThr) <= FAILSAFE_US;
-  bool     dirOk = (now - lastDir) <= FAILSAFE_US;
 
   // --- Serial override (mini computer takes priority over RC when active) ---
   // parseSerialCmd();
@@ -350,38 +351,44 @@ void loop() {
     // --- Throttle switch relay: ON when armed ---
     digitalWrite(PIN_THR_SW, HIGH);
 
-    // --- Direction: dir stick selects relay (forward / reverse) ---
-    static const int32_t DIR_DEAD = 50;
-    int32_t dir_rel = dirOk ? ((int32_t)dir - 1500) : 0;
+    // --- Direction + speed: single thr channel (center=500us, >500=fwd, <500=rev) ---
+    static const int32_t THR_CENTER = 500;
+    static const int32_t THR_DEAD   = 10;   // dead zone +-10us — increase if relay chatters
+    static const int32_t THR_HYST   = 5;    // hysteresis band
+    static const int32_t THR_RANGE  = 300;
+    static const uint8_t MAX_DUTY   = 90;    
+    int32_t thr_rel = (int32_t)thr - THR_CENTER;
 
-    if (dir_rel > DIR_DEAD) {
-      digitalWrite(PIN_RELAY1, HIGH);  // forward
+    switch (relayState) {
+      case 0:  // coast — activate only past full dead zone
+        if      (thr_rel < -THR_DEAD)  relayState =  1;
+        else if (thr_rel >  THR_DEAD)  relayState = -1;
+        break;
+      case 1:  // forward — release only when signal returns inside hysteresis band
+        if (thr_rel > -(THR_DEAD - THR_HYST))  relayState = 0;
+        break;
+      case -1: // reverse — release only when signal returns inside hysteresis band
+        if (thr_rel < (THR_DEAD - THR_HYST))   relayState = 0;
+        break;
+    }
+
+    if (relayState == 1) {
+      digitalWrite(PIN_RELAY1, HIGH);
       digitalWrite(PIN_RELAY2, LOW);
-    } else {//if (dir_rel < -DIR_DEAD) {
+    } else if (relayState == -1) {
       digitalWrite(PIN_RELAY1, LOW);
-      digitalWrite(PIN_RELAY2, HIGH);  // reverse
-    } 
-    // else {
-    //   digitalWrite(PIN_RELAY1, LOW);
-    //   digitalWrite(PIN_RELAY2, LOW);   // neutral
-    // }
+      digitalWrite(PIN_RELAY2, HIGH);
+    } else {
+      digitalWrite(PIN_RELAY1, LOW);
+      digitalWrite(PIN_RELAY2, LOW);
+    }
 
-    // --- Speed: thr stick controls PWM magnitude (center-return, 1500=stop) ---
-    static const int32_t THR_DEAD  = 50;
-    static const int32_t THR_RANGE = 250;  // 1500+250=1750 = top of control range
-    static const uint8_t MAX_DUTY  = 100;    // hard cap ~1-2 km/h; raise if too slow
-
-    int32_t thr_rel = thrOk ? ((int32_t)thr - 1500) : 0;
-    uint8_t duty = (abs(thr_rel) > THR_DEAD)
+    uint8_t duty = (relayState != 0)
                    ? (uint8_t)constrain(abs(thr_rel) * MAX_DUTY / THR_RANGE, 0, MAX_DUTY)
                    : 0;
     setDutyPercent(duty);
-    Serial.println("Duty = ");
-    Serial.print(steer);
 
     // --- Steering CAN position ---
-    uint32_t lastSteer;
-    noInterrupts(); lastSteer = rcLastMicros[PIN_RC_STEER]; interrupts();
     bool steerValid = (steer > 900 && steer < 2100); //&& (serialActive || lastSteer > 0);
     if (steerValid) {
       if (abs((long)steer - 1500) < 30) steer = 1500;
@@ -418,6 +425,7 @@ void loop() {
     Serial.print(" arm=");    Serial.print(arm);
     Serial.print(" steer=");  Serial.print(steer);
     Serial.print(" relay=");  Serial.print(dir);
+    Serial.print(" relay="); Serial.print(relayState);
     Serial.print(" -> deg="); Serial.println(currentTargetAngle, 2);
   }
 }
