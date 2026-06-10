@@ -315,15 +315,15 @@ void loop() {
   bool     dirOk = (now - lastDir) <= FAILSAFE_US;
 
   // --- Serial override (mini computer takes priority over RC when active) ---
-  parseSerialCmd();
-  bool serialActive = (millis() - cmdLastMs) < CMD_TIMEOUT_MS;
-  if (serialActive) {
-    thr   = cmdThr;
-    dir   = cmdDir;
-    steer = cmdSteer;
-    arm   = cmdArm;
-    armOk = thrOk = dirOk = true;
-  }
+  // parseSerialCmd();
+  // bool serialActive = (millis() - cmdLastMs) < CMD_TIMEOUT_MS;
+  // if (serialActive) {
+  //   thr   = cmdThr;
+  //   dir   = cmdDir;
+  //   steer = cmdSteer;
+  //   arm   = cmdArm;
+  //   armOk = thrOk = dirOk = true;
+  // }
 
   // --- Arm logic ---
   bool newArmed = armed;
@@ -331,20 +331,20 @@ void loop() {
   else if (arm < ARM_OFF_US) newArmed = false;
   else if (arm > ARM_ON_US)  newArmed = true;
 
-  if (newArmed && !armed) {
+  // if (newArmed && !armed) {
     sendEnable();
     motorEnabled = true;
-    Serial.println("ARMED -> sent ABS_POS_MODE + ENABLE");
-  } else if (!newArmed && armed) {
-    sendDisable();
-    motorEnabled = false;
-    digitalWrite(PIN_THR_SW, LOW);
-    digitalWrite(PIN_RELAY1,  LOW);
-    digitalWrite(PIN_RELAY2,  LOW);
-    setDutyPercent(0);
-    Serial.println("DISARM -> sent DISABLE");
-  }
-  armed = newArmed;
+    // Serial.println("ARMED -> sent ABS_POS_MODE + ENABLE");
+  // } else if (!newArmed && armed) {
+  //   sendDisable();
+  //   motorEnabled = false;
+  //   digitalWrite(PIN_THR_SW, LOW);
+  //   digitalWrite(PIN_RELAY1,  LOW);
+  //   digitalWrite(PIN_RELAY2,  LOW);
+  //   setDutyPercent(0);
+  //   Serial.println("DISARM -> sent DISABLE");
+  // }
+  armed = true;//newArmed;
 
   if (armed) {
     // --- Throttle switch relay: ON when armed ---
@@ -357,29 +357,32 @@ void loop() {
     if (dir_rel > DIR_DEAD) {
       digitalWrite(PIN_RELAY1, HIGH);  // forward
       digitalWrite(PIN_RELAY2, LOW);
-    } else if (dir_rel < -DIR_DEAD) {
+    } else {//if (dir_rel < -DIR_DEAD) {
       digitalWrite(PIN_RELAY1, LOW);
       digitalWrite(PIN_RELAY2, HIGH);  // reverse
-    } else {
-      digitalWrite(PIN_RELAY1, LOW);
-      digitalWrite(PIN_RELAY2, LOW);   // neutral
-    }
+    } 
+    // else {
+    //   digitalWrite(PIN_RELAY1, LOW);
+    //   digitalWrite(PIN_RELAY2, LOW);   // neutral
+    // }
 
     // --- Speed: thr stick controls PWM magnitude (center-return, 1500=stop) ---
     static const int32_t THR_DEAD  = 50;
     static const int32_t THR_RANGE = 250;  // 1500+250=1750 = top of control range
-    static const uint8_t MAX_DUTY  = 40;    // hard cap ~1-2 km/h; raise if too slow
+    static const uint8_t MAX_DUTY  = 100;    // hard cap ~1-2 km/h; raise if too slow
 
     int32_t thr_rel = thrOk ? ((int32_t)thr - 1500) : 0;
     uint8_t duty = (abs(thr_rel) > THR_DEAD)
                    ? (uint8_t)constrain(abs(thr_rel) * MAX_DUTY / THR_RANGE, 0, MAX_DUTY)
                    : 0;
     setDutyPercent(duty);
+    Serial.println("Duty = ");
+    Serial.print(steer);
 
     // --- Steering CAN position ---
     uint32_t lastSteer;
     noInterrupts(); lastSteer = rcLastMicros[PIN_RC_STEER]; interrupts();
-    bool steerValid = (steer > 900 && steer < 2100) && (serialActive || lastSteer > 0);
+    bool steerValid = (steer > 900 && steer < 2100); //&& (serialActive || lastSteer > 0);
     if (steerValid) {
       if (abs((long)steer - 1500) < 30) steer = 1500;
       float angle = (float)((long)steer - 1500) * 1.35f;
@@ -410,7 +413,7 @@ void loop() {
   static uint32_t lastDebug = 0;
   if (millis() - lastDebug > 500) {
     lastDebug = millis();
-    Serial.print(serialActive ? "SER" : "RC");
+    // Serial.print(serialActive ? "SER" : "RC");
     Serial.print(" thr=");  Serial.print(thr);
     Serial.print(" arm=");    Serial.print(arm);
     Serial.print(" steer=");  Serial.print(steer);

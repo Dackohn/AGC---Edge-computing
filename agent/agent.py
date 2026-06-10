@@ -51,6 +51,7 @@ TOPIC_STATUS         = f"agc/{VEHICLE_ID}/status"
 ARRIVAL_RADIUS_M  = float(os.environ.get("ARRIVAL_RADIUS_M", "3.0"))
 HEADING_DEADBAND  = float(os.environ.get("HEADING_DEADBAND", "10.0"))
 MAX_STEER_ANGLE   = float(os.environ.get("MAX_STEER_ANGLE",  "30.0"))
+HEADING_ALPHA     = float(os.environ.get("HEADING_ALPHA",    "0.25"))  # EMA smoothing (0=frozen,1=raw)
 NAV_LOOP_HZ       = int(os.environ.get("NAV_LOOP_HZ",        "5"))
 NAV_SPEED         = float(os.environ.get("NAV_SPEED",         "0.1"))
 MANUAL_SPEED      = float(os.environ.get("MANUAL_SPEED",      "0.05"))
@@ -71,7 +72,7 @@ _manual_cmd: tuple[str, str] | None = None  # (throttle_char, steer_char) of las
 # Steer position tracking — each 'a'/'d' = ±60µs from center 1500
 # 0.5 rotations = 180° → 133µs → max 2 presses; use 3 for margin
 # GPS state (populated by Pixhawk reader thread)
-_gps: dict = {"lat": None, "lon": None, "heading_deg": None, "speed": None, "satellites": None, "fix_type": None}
+_gps: dict = {"lat": None, "lon": None, "heading_deg": None, "heading_filtered": None, "speed": None, "satellites": None, "fix_type": None}
 _gps_lock = threading.Lock()
 
 # Computed heading from GPS position delta (reliable when moving, compass-independent)
@@ -195,29 +196,38 @@ def pixhawk_reader_loop() -> None:
                     if msg.get_type() == "GLOBAL_POSITION_INT":
                         new_lat = msg.lat / 1e7
                         new_lon = msg.lon / 1e7
+                        raw_hdg = msg.hdg / 100 if msg.hdg != 65535 else None
                         _gps["lat"]         = new_lat
                         _gps["lon"]         = new_lon
-                        _gps["heading_deg"] = msg.hdg / 100 if msg.hdg != 65535 else None
+                        _gps["heading_deg"] = raw_hdg
                         _gps["speed"]       = msg.vz / 100
+                        # EMA filter on compass — wrap-aware to handle 0°/360° boundary
+                        if raw_hdg is not None:
+                            prev = _gps["heading_filtered"]
+                            if prev is None:
+                                _gps["heading_filtered"] = raw_hdg
+                            else:
+                                diff = _norm_angle(raw_hdg - prev)
+                                _gps["heading_filtered"] = (prev + HEADING_ALPHA * diff + 360) % 360
                     elif msg.get_type() == "GPS_RAW_INT":
                         _gps["satellites"]  = msg.satellites_visible
                         _gps["fix_type"]    = FIX_TYPES.get(msg.fix_type, "Unknown")
 
-                # compute heading from position delta when moving
+                # compute heading from GPS position delta — same logic as the simulator.
+                # Does not use vz (vertical speed) — that's always ~0 on flat ground.
                 with _gps_lock:
-                    spd = _gps["speed"]
                     lat = _gps["lat"]
                     lon = _gps["lon"]
-                if lat and lon and spd is not None and abs(spd) > 0.05:
+                if lat and lon:
                     if _prev_gps_pos is not None:
                         prev_lat, prev_lon = _prev_gps_pos
                         dist = _haversine(prev_lat, prev_lon, lat, lon)
-                        if dist > 0.5:  # at least 0.5m moved to compute reliably
+                        if dist > 0.3:  # 30 cm movement — enough to get a reliable bearing
                             _computed_heading = _bearing(prev_lat, prev_lon, lat, lon)
-                    _prev_gps_pos = (lat, lon)
-                else:
-                    _prev_gps_pos = None
-                    _computed_heading = None  # clear stale track so compass takes over when stopped
+                            _prev_gps_pos = (lat, lon)
+                        # don't reset prev_pos on small movements — keep accumulating
+                    else:
+                        _prev_gps_pos = (lat, lon)
 
                 now = time.time()
                 if now - last_log >= LOG_INTERVAL:
@@ -241,8 +251,10 @@ def pixhawk_reader_loop() -> None:
                             wp = waypoints[wp_index]
                             dist    = _haversine(lat, lon, wp["lat"], wp["lon"])
                             bearing = _bearing(lat, lon, wp["lat"], wp["lon"])
-                            if hdg is not None:
-                                err = _norm_angle(bearing - hdg)
+                            # prefer GPS-track heading — compass may be offset from movement direction
+                            display_hdg = _computed_heading if _computed_heading is not None else hdg
+                            if display_hdg is not None:
+                                err = _norm_angle(bearing - display_hdg)
                                 turn = ("straight" if abs(err) < 10
                                         else ("turn RIGHT ▶" if err > 0 else "◀ turn LEFT"))
                                 nav_hint = f"  →  {turn} ({err:+.1f}°)  dist={dist:.1f}m"
@@ -309,7 +321,7 @@ def navigation_loop() -> None:
                 with _gps_lock:
                     cur_lat     = _gps["lat"]
                     cur_lon     = _gps["lon"]
-                    cur_heading = _gps["heading_deg"]
+                    cur_heading = _gps["heading_filtered"] or _gps["heading_deg"]
 
                 if cur_lat is None or cur_lon is None:
                     log.warning("NAV waiting for GPS fix...")
@@ -328,36 +340,31 @@ def navigation_loop() -> None:
 
                 spd_us = int(1500 + NAV_SPEED * 400)
 
-                # Compass (cur_heading) is available immediately and works from standstill.
-                # GPS-computed heading (from position delta) is more accurate when moving but
-                # needs the vehicle to have travelled >0.5 m — use it only then.
+                # Prefer GPS-track heading (same logic as simulator) — immune to compass orientation.
+                # Falls back to filtered compass when vehicle hasn't moved 30 cm yet.
                 effective_heading = _computed_heading if _computed_heading is not None else cur_heading
 
                 if effective_heading is not None:
                     heading_error = _norm_angle(bearing - effective_heading)
-                    if heading_error > HEADING_DEADBAND:
-                        steer = STEER_RIGHT
-                    elif heading_error < -HEADING_DEADBAND:
-                        steer = STEER_LEFT
-                    else:
-                        steer = STEER_CTR
+                    # Proportional steering: scale linearly with error, saturate at MAX_STEER_ANGLE
+                    steer_frac = max(-1.0, min(1.0, heading_error / MAX_STEER_ANGLE))
+                    steer = int(STEER_CTR + steer_frac * (STEER_RIGHT - STEER_CTR))
                 else:
-                    heading_error = 0
+                    heading_error = 0.0
                     steer = STEER_CTR  # go straight until we have a heading
 
-                # Cut throttle while turning sharply
-                if abs(heading_error) > MAX_STEER_ANGLE:
-                    if not was_turning:
-                        log.info("NAV sharp turn — holding throttle  err=%.1f°", heading_error)
-                        was_turning = True
-                    send_serial_cmd(1500, 1500, steer, ARM_ON)  # stop, keep steering
-                else:
+                thr_us = int(1500 + NAV_SPEED * 400)
+                if abs(heading_error) > MAX_STEER_ANGLE and not was_turning:
+                    log.info("NAV sharp turn  err=%.1f°", heading_error)
+                    was_turning = True
+                elif abs(heading_error) <= MAX_STEER_ANGLE:
                     was_turning = False
-                    send_serial_cmd(int(1500 + NAV_SPEED * 400), 1400, steer, ARM_ON)  # forward
-                    log.info("NAV dist=%.1fm bearing=%.1f° heading=%s° err=%.1f°",
-                             dist, bearing,
-                             f"{effective_heading:.1f}" if effective_heading is not None else "?",
-                             heading_error)
+
+                send_serial_cmd(thr_us, 1600, steer, ARM_ON)  # 1600 = forward (compass = vehicle front)
+                log.info("NAV dist=%.1fm bearing=%.1f° heading=%s° err=%.1f°",
+                         dist, bearing,
+                         f"{effective_heading:.1f}" if effective_heading is not None else "?",
+                         heading_error)
 
                 time.sleep(interval)
 
