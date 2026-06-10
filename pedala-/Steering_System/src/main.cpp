@@ -316,15 +316,17 @@ void loop() {
   bool     armOk = (now - lastArm) <= FAILSAFE_US;
 
   // --- Serial override (mini computer takes priority over RC when active) ---
-  // parseSerialCmd();
-  // bool serialActive = (millis() - cmdLastMs) < CMD_TIMEOUT_MS;
-  // if (serialActive) {
-  //   thr   = cmdThr;
-  //   dir   = cmdDir;
-  //   steer = cmdSteer;
-  //   arm   = cmdArm;
-  //   armOk = thrOk = dirOk = true;
-  // }
+  parseSerialCmd();
+  bool serialActive = (millis() - cmdLastMs) < CMD_TIMEOUT_MS;
+  if (serialActive) {
+    // cmdThr is 1500-center (1500=stop, 1600-2000=speed), cmdDir 1500-center (>1550=fwd, <1450=rev)
+    // Translate to single-channel thr (500=stop, >500=fwd, <500=rev), range 200-800
+    uint16_t spd_abs = (uint16_t)constrain(abs((int32_t)cmdThr - 1500), 0, 500);
+    if      (cmdDir > 1550) thr = 500 + (spd_abs / 2);   // forward: 500–750
+    else if (cmdDir < 1450) thr = 500 - (spd_abs / 2);   // reverse: 500–250
+    else                    thr = 500;                    // stop
+    steer = cmdSteer;  // 900-2100 passes directly through steerValid
+  }
 
   // --- Arm logic ---
   bool newArmed = armed;

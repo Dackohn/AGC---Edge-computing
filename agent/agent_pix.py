@@ -59,6 +59,8 @@ MQTT_PASSWORD    = os.environ.get("MQTT_PASSWORD",     "")
 VEHICLE_ID       = os.environ.get("VEHICLE_ID",        "vehicle")
 PIXHAWK_PORT     = os.environ.get("PIXHAWK_PORT",      "/dev/ttyUSB0")
 PIXHAWK_BAUD     = int(os.environ.get("PIXHAWK_BAUD",  "115200"))
+ARDUINO_PORT     = os.environ.get("SERIAL_PORT", os.environ.get("ARDUINO_PORT", ""))  # COM12 / /dev/ttyUSB0
+ARDUINO_BAUD     = int(os.environ.get("SERIAL_BAUD", os.environ.get("ARDUINO_BAUD", "115200")))
 TELEMETRY_HZ     = float(os.environ.get("TELEMETRY_HZ", "0.5"))
 CRUISE_ALT_M     = float(os.environ.get("CRUISE_ALT_M", "0"))
 ARRIVAL_RADIUS_M = float(os.environ.get("ARRIVAL_RADIUS_M", "3.0"))
@@ -92,9 +94,34 @@ TOPIC_STATUS         = f"agc/{VEHICLE_ID}/status"
 # Shared state
 # ---------------------------------------------------------------------------
 
-_vehicle     = None          # dronekit Vehicle object
-_mqtt_client = None
+_vehicle      = None          # dronekit Vehicle object
+_mqtt_client  = None
+_arduino      = None          # pyserial Serial to Arduino Nano
 _vehicle_lock = threading.Lock()
+_arduino_lock = threading.Lock()
+
+
+def _send_arduino(thr: int, dir_: int, steer: int, arm: int = 2000) -> None:
+    """Write a CMD: line to the Arduino serial port (fire-and-forget)."""
+    with _arduino_lock:
+        ser = _arduino
+    if ser is None or not ser.is_open:
+        return
+    try:
+        ser.write(f"CMD:{thr},{dir_},{steer},{arm}\n".encode())
+    except Exception as e:
+        log.debug("Arduino serial write: %s", e)
+
+
+def _arduino_cmd_from_analog(throttle: float, steering: float) -> None:
+    """Translate joystick (-1..1) to Arduino CMD: format and send."""
+    spd = int(abs(throttle) * 500)               # 0-500 speed magnitude
+    thr_us  = 1500 + spd                          # 1500-2000 (magnitude only)
+    dir_us  = (1600 if throttle >= 0.02
+               else 1400 if throttle <= -0.02
+               else 1500)                         # fwd / rev / neutral
+    steer_us = max(900, min(2100, int(1500 + steering * 600)))  # 900-2100 full range
+    _send_arduino(thr_us, dir_us, steer_us)
 
 _nav: dict = {"active": False, "waypoints": [], "wp_index": 0, "status": "idle"}
 _nav_lock  = threading.Lock()
@@ -357,11 +384,33 @@ def on_mqtt_message(client, userdata, msg: mqtt.MQTTMessage) -> None:
         with _nav_lock:
             _nav["active"] = False
 
-        direction = payload.get("direction", "stop")
-        speed     = max(0.0, min(1.0, float(payload.get("speed", 0.5))))
-
-        _direction_to_rc(direction, speed)
-        log.info("manual %-8s spd=%.2f", direction, speed)
+        if "throttle" in payload or "steering" in payload:
+            # Analog joystick format: throttle/steering in [-1, 1]
+            throttle = max(-1.0, min(1.0, float(payload.get("throttle", 0))))
+            steering = max(-1.0, min(1.0, float(payload.get("steering", 0))))
+            if abs(throttle) < 0.02 and abs(steering) < 0.02:
+                _clear_rc_override()
+                _send_arduino(1500, 1500, 1500)   # stop
+            else:
+                thr_pwm = (int(PWM_CENTER + throttle * (PWM_MAX - PWM_CENTER))
+                           if throttle >= 0
+                           else int(PWM_CENTER + throttle * (PWM_CENTER - PWM_MIN)))
+                steer_pwm = int(PWM_CENTER + steering * (STEER_RIGHT - PWM_CENTER))
+                _set_rc_override(thr_pwm, steer_pwm)
+                _arduino_cmd_from_analog(throttle, steering)
+            log.debug("joystick thr=%.2f steer=%.2f", throttle, steering)
+        else:
+            direction = payload.get("direction", "stop")
+            speed     = max(0.0, min(1.0, float(payload.get("speed", 0.5))))
+            _direction_to_rc(direction, speed)
+            # Map legacy direction/speed to Arduino serial
+            spd = int(speed * 500)
+            if direction == "forward":  _send_arduino(1500 + spd, 1600, 1500)
+            elif direction == "backward": _send_arduino(1500 + spd, 1400, 1500)
+            elif direction == "left":   _send_arduino(1500 + spd, 1600, 1200)
+            elif direction == "right":  _send_arduino(1500 + spd, 1600, 1800)
+            else:                       _send_arduino(1500, 1500, 1500)
+            log.info("manual %-8s spd=%.2f", direction, speed)
 
     elif msg.topic == TOPIC_MISSION:
         waypoints = payload.get("waypoints", [])
@@ -382,6 +431,7 @@ def on_mqtt_message(client, userdata, msg: mqtt.MQTTMessage) -> None:
         with _nav_lock:
             _nav["active"] = False
         _stop_vehicle(disarm=True)
+        _send_arduino(1500, 1500, 1500, arm=1000)  # disarm Arduino
         log.warning("EMERGENCY STOP")
         _publish_status("EMERGENCY STOP")
 
@@ -454,7 +504,15 @@ def vehicle_connection_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _mqtt_client
+    global _mqtt_client, _arduino
+
+    if ARDUINO_PORT:
+        try:
+            import serial as _serial
+            _arduino = _serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=0.1)
+            log.info("Arduino serial open: %s @ %d", ARDUINO_PORT, ARDUINO_BAUD)
+        except Exception as e:
+            log.warning("Arduino serial open failed (%s) — continuing without it", e)
 
     threading.Thread(target=vehicle_connection_loop, daemon=True).start()
     threading.Thread(target=navigation_loop,         daemon=True).start()
